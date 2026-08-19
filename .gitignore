@@ -1,0 +1,20 @@
+# runtime artifacts
+logs/
+*.log
+
+# local configuration (per-machine paths) - use dsh-tray.example.json as a template
+dsh-tray.json
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+
+# local tooling snapshots (browser-MCP captures / session logs)
+.playwright-mcp/
+
+# stray command-redirect artifacts (e.g. `cmd /c ... > 0`):
+# a single-character, extension-less file created at the repo root by a
+# redirected command's stdout. `/0` covers the known artifact; `/?` catches
+# any other single-byte/nameless file of the same kind.
+/0
+/?
