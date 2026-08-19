@@ -65,8 +65,9 @@ wscript //nologo dsh-tray-launch.vbs
 | `maxagentloglines` | `200` | **v1.4.0** 代理日志窗口显示行数上限 |
 | `agenthistorylines` | `40` | **v1.4.0** 拉取 subagent.history 事件数（日志尾部） |
 | `chromeapplnk` | *(空)* | **v1.4.1** Chrome App 快捷方式路径。设置后「打开面板」/双击图标/新对话都在独立 Chrome 应用窗口打开，而非新标签页；为空或失效则回退为普通浏览器标签。常见位置：① `Start Menu\Programs\Chrome Apps\DeepSeek Harness.lnk`；② 若 PWA 安装在某个 Chrome 配置文件内：`…\Chrome\User Data\Profile N\Web Applications\_crx_<appid>\DeepSeek Harness.lnk`（用真实存在的那个，检查其目标是 `chrome_proxy.exe` 而非 `dsh-tray-launch.vbs`） |
-| `menutheme` | `auto` | **v1.5.0** 菜单主题：`auto`（跟随系统明/暗）/ `light` / `dark` |
+| `menutheme` | `dark` | **v1.5.0 / v1.8.0** 菜单与 toast 主题：`auto`（跟随系统明/暗）/ `light` / `dark`。**v1.8.0 起默认 `dark`**，且可在托盘菜单「主题 / Theme / 主题」子菜单中即时切换（写回 dsh-tray.json，无需重启） |
 | `toastson` | `true` | **v1.5.0** `true` → 现代 Windows 11 通知（自绘圆角 toast + 强调色条 + 鲸鱼图标）；`false` → 经典系统气泡（回退） |
+| `toastduration` | `4000` | **v1.8.0** toast 自动关闭前停留时间（毫秒，范围 1000–60000）。**v1.8.0 修复了 toast「永远不消失」**：所有 toast 计时器现在有根引用，另有 250ms 巡检在 duration+2500ms 硬上限强制关闭，任何情况下 toast 都不会无限悬挂 |
 | `menubicons` | `true` | **v1.5.0** 在菜单项上显示 MDL2 图标（Segoe MDL2 Assets 字体内置绘制，无需外部图片） |
 | `uifont` | `Segoe UI Variable Text` | **v1.6.0** 菜单与 toast 的统一字体；系统无此字体时自动回退 `Segoe UI` |
 | `uifontsize` | `9` | **v1.6.0** 菜单 / toast 正文字号的基准（pt）；标题自动 +1 |
@@ -132,6 +133,8 @@ logs\dsh-tray.log       # 托盘自身日志（运行时生成，不入库）
 | 📜 代理日志 | **v1.4.0** 弹窗展示代理最近输出（assistant 正文 + turn 结束原因），点击「查看日志」打开 |
 | 🔔 代理通知 | **v1.4.0** 代理启动 / 完成 / 等待输入时通知气泡（`agentnotifications` 可关） |
 | 💬 通知气泡 | 状态跳变（启动/停止/恢复/异常/自动重启）时通知，不刷屏 |
+| ⏱️ Toast 自动关闭 | **v1.8.0** 修复 toast 悬挂问题：自动关闭计时器全部根级持有 + 250ms 硬截止扫描（duration+2500ms 强制关闭），toast 再也不会「一直挂着」；停留时长可用 `toastduration` 调节 |
+| 🌙 深色设计 | **v1.8.0** 默认深色主题；菜单 / toast / 图标全套深色调色板（近黑面板、柔和悬停、高对比文字）；菜单「Тема / Theme / 主题」即时切换 自动/浅色/深色并写入配置 |
 | 🪟 Chrome 应用 | **v1.4.1** 「打开面板」/双击图标/新对话在独立 **Chrome 应用（PWA）** 窗口打开，而非新标签页（配置 `chromeapplnk` 指向 `Chrome Apps\DeepSeek Harness.lnk`；失效则回退普通标签页） |
 | 🚪 退出 | **v1.4.1** 「退出」停止 dsh 服务并彻底关闭托盘程序本身（「停止 dsh」只停服务、托盘留在托盘） |
 | 🛡️ 看门狗 | 只管生命周期：进程活着绝不杀；崩溃才重启（5s→30s 退避） |
@@ -149,6 +152,7 @@ logs\dsh-tray.log       # 托盘自身日志（运行时生成，不入库）
 
 | 版本 | 内容 |
 |---|---|
+| **v1.8.0** | 🔔 **toast 自动关闭修复 + 深色设计**：修复通知「挂在屏幕永不消失」——根因是 fade-out / 自动关闭的 WinForms Timer 作为事件闭包里的无根局部变量被 GC 回收，fade 永不执行；现在所有 toast 计时器挂在脚本级注册表（`$script:ToastTimers`）+ toast 上下文包，另加 250ms 硬截止扫描（duration+2500ms 强制关闭），toast 寿命有严格上限。新增 `toastduration`（毫秒，默认 4000）。🌇 **深色设计**：默认 `menutheme: dark`，菜单/toast/图标深色调色板重做（更漆黑的表面、更柔和的悬停、深色下更高对比）；菜单图标按主题即时重绘；新增菜单「Тема ▸ 自动/浅色/深色」子菜单，即时切换并把 `menutheme` 写回 `dsh-tray.json`。 |
 | **v1.7.1** | 🛡️ **崩溃-循环稳定化 + 不再卡 UI 的菜单动作**：修复 backoff 永不增长的 bug（RestartCount 不再在每次 `Start-Process` 后被清零，只在真正 Healthy 时重置 → 退避 5s→30s 真实生效）；新增 `maxconsecutiverestarts`（默认 10）上限，超过后停止自动重启、状态「需要干预」+ 一次错误 toast，手动「重启 dsh」重置。「开启新对话」与「停止代理」改为后台 runspace 执行（UI Automation / RPC 不再阻塞点击，新对话菜单项在执行期间显示禁用/"…"）；`Read-Config` 数值字段校验（非数字/非正/越界 → WARN + 回退默认值）。 |
 | **v1.6.0** | ✨ **统一平滑字体 + 更新检查**：菜单/图标/toast 统一使用配置字体（`uifont`，默认 Win11 的 Segoe UI Variable，自动回退 Segoe UI）；MDL2 图标与文字改用平滑抗锯齿（`Antialias` 替代 `AntiAliasGridFit`），消除“锯齿/毛边”；新增进程级 DPI 感知。新增**「检查更新」**菜单 + 周期自动检查（`updatecheck`/`updateintervalhours`）**@deepseek-ai/dsh（npm）**新版本；发现新版 → Win11 toast「发现新版本 X → Y」；`updateapply: true` 时**「更新到 vN」一键 `npm i -g` 并重启 dsh**。 |
 | **v1.5.0** | ✨ **Windows 11 现代 UI**：菜单改用 fluent 配色 + 跟随系统明/暗主题 + DWM 圆角；菜单项加 MDL2 图标（保留 DeepSeek 鲸鱼品牌）；状态/错误/停止托盘图标改为鲸鱼 + 彩色圆环（不再用系统标准图标，并修复旧 `DrawIcon` 徽标 WARN）；通知由经典气泡升级为自绘 Windows 11 toast（圆角 + 强调色条 + 鲸鱼 + 点击打开 + 4 秒自关）。新配置：`menutheme` / `toastson` / `menubicons` |
@@ -180,3 +184,4 @@ logs\dsh-tray.log       # 托盘自身日志（运行时生成，不入库）
 - **Smooth fonts + update checks (v1.6.0):** a unified configurable UI font (`uifont`, default Win11 "Segoe UI Variable" with automatic Segoe UI fallback; `uifontsize`) is applied to the menu, toasts and MDL2 icons; MDL2 glyphs and text now use smooth anti-aliasing (`Antialias` instead of `AntiAliasGridFit`) plus process-level DPI awareness, removing jagged/"rough" edges. A **「Check for Updates」** menu item plus a periodic auto-check (`updatecheck`, `updateintervalhours`) polls **`@deepseek-ai/dsh` on npm**; a new version raises a Win11 toast "New version X → Y", and with `updateapply: true` a **「Update to vN」** item runs `npm i -g @deepseek-ai/dsh@latest` and restarts dsh in one click.
 - Requires `npm i -g @deepseek-ai/dsh`; Windows PowerShell 5.1+; UTF-8 **with BOM** for `dsh-tray.ps1` (contains non-ASCII zh/ru) — a bare no-BOM UTF-8 file is decoded as ANSI and will not parse
 - **Crash-loop hardening (v1.7.1):** the restart backoff really escalates now (5s → 30s, `restartdelayseconds * min(restarts, 6)`) because the crash counter is only reset when dsh is confirmed Healthy again; after `maxconsecutiverestarts` (default 10) consecutive crashes the tray stops auto-restarting, shows a "Needs intervention" status + one error toast, and the manual **Restart dsh** item resets the counter. "New Conversation" and "Stop agent" menu actions run their UI-Automation/RPC work on background runspaces so clicks never block the UI; `Read-Config` now rejects garbage numeric config values with a logged WARN.
+- **Toast auto-dismiss fixed + dark design (v1.8.0):** toasts no longer hang on screen forever — the auto-dismiss/fade timers now live on a script-scope registry plus the toast's own context, and a 250ms sweep force-closes any toast past `toastduration` (default 4000 ms) + 2.5 s, so a toast's lifetime is strictly bounded. The app now ships dark by default (`menutheme: dark`), with a reworked dark palette for the menu, fluent color table and toasts; a new **Theme** submenu (Auto / Light / Dark) switches the look live and persists `menutheme` to `dsh-tray.json`.

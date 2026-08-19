@@ -865,4 +865,59 @@ Describe "Read-Config (numeric validation, v1.7.1)" {
         @{ maxconsecutiverestarts = "lots" } | ConvertTo-Json | Set-Content -LiteralPath $tmp -Encoding UTF8
         (Read-Config -ConfigPath $tmp).maxconsecutiverestarts | Should Be 10
     }
+
+    It "defaults toastduration to 4000 and validates it (v1.8.0)" {
+        $cfg = Read-Config -ConfigPath (Join-Path $TestDrive "nonexistent.json")
+        $cfg.toastduration | Should Be 4000
+        $tmp = Join-Path $TestDrive "toast-ms.json"
+        @{ toastduration = 2500 } | ConvertTo-Json | Set-Content -LiteralPath $tmp -Encoding UTF8
+        (Read-Config -ConfigPath $tmp).toastduration | Should Be 2500
+        $bad = Join-Path $TestDrive "toast-bad.json"
+        @{ toastduration = 50 } | ConvertTo-Json | Set-Content -LiteralPath $bad -Encoding UTF8    # below the 1000ms floor
+        (Read-Config -ConfigPath $bad).toastduration | Should Be 4000
+        $str = Join-Path $TestDrive "toast-str.json"
+        @{ toastduration = "not-a-number" } | ConvertTo-Json | Set-Content -LiteralPath $str -Encoding UTF8
+        (Read-Config -ConfigPath $str).toastduration | Should Be 4000
+    }
+}
+
+Describe "Resolve-MenuTheme (v1.8.0)" {
+    BeforeEach {
+        $script:SavedTheme = $script:Config.menutheme
+    }
+    AfterEach {
+        $script:Config.menutheme = $script:SavedTheme
+    }
+
+    It "returns false when the config forces light" {
+        $script:Config.menutheme = "light"
+        Resolve-MenuTheme | Should Be $false
+    }
+
+    It "returns true when the config forces dark" {
+        $script:Config.menutheme = "dark"
+        Resolve-MenuTheme | Should Be $true
+    }
+
+    It "follows the system when set to auto" {
+        $script:Config.menutheme = "auto"
+        $resolved = Resolve-MenuTheme
+        # 'auto' must resolve to the OS setting (Get-SystemDarkMode), not stay "auto".
+        ($resolved -is [bool]) | Should Be $true
+    }
+}
+
+Describe "Test-ToastDeadlineExceeded (v1.8.0 sweep)" {
+    It "is false before the deadline" {
+        Test-ToastDeadlineExceeded -ShownAt (Get-Date).AddSeconds(-5) -Now (Get-Date) -DurationMs 4000 -GraceMs 2500 | Should Be $false
+    }
+
+    It "is true once duration + grace passed" {
+        Test-ToastDeadlineExceeded -ShownAt (Get-Date).AddSeconds(-7) -Now (Get-Date) -DurationMs 4000 -GraceMs 2500 | Should Be $true
+    }
+
+    It "is false for an uninitialised show time or negative duration" {
+        Test-ToastDeadlineExceeded -ShownAt ([DateTime]::MinValue) -Now (Get-Date) -DurationMs 4000 -GraceMs 2500 | Should Be $false
+        Test-ToastDeadlineExceeded -ShownAt (Get-Date).AddSeconds(-10) -Now (Get-Date) -DurationMs -1 -GraceMs 2500 | Should Be $false
+    }
 }

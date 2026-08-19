@@ -1,7 +1,24 @@
 ﻿# =============================================================================
 # dsh-tray.ps1 - DeepSeek Harness (dsh web) Windows-native tray controller
 #
-# Version: 1.7.1
+# Version: 1.8.0
+#
+# 1.8.0 (notifications + dark design):
+#   - FIXED: toasts no longer stay on screen forever. The auto-dismiss chain
+#     (fade-in -> 4s hold -> fade-out) relied on WinForms Timers created inside
+#     event-handler closures and stored nowhere - they were garbage-collected,
+#     so the fade-out never ran and the toast hung at full opacity indefinitely.
+#     Every toast timer is now rooted in a script-scope registry
+#     ($script:ToastTimers) AND in the toast's own context bag; a 250ms sweep
+#     timer force-closes any toast past a hard deadline (duration + 2.5s),
+#     so a toast can never outlive its lifetime even under pathological
+#     conditions. New config toastduration (ms, default 4000) tunes the hold.
+#   - Dark design pass: default menutheme is now "dark" (dsh-tray.json), the
+#     dark palettes for the menu, the fluent color table and the toasts are
+#     reworked (darker surfaces, better hover/border contrast, softer dim text),
+#     and menu glyph icons re-render with the active theme. A new "Theme"
+#     submenu switches Auto / Light / Dark live and persists menutheme back to
+#     dsh-tray.json without editing the file.
 #
 # 1.7.1 (stability): crash-loop backoff actually escalates + restart cap
 #   - RestartCount (which drives the 5s -> 30s restart backoff) is no longer
@@ -68,7 +85,7 @@
 # tray process (taskkill /PID <tray-pid> /F).
 # =============================================================================
 
-$script:Version = "1.7.1"
+$script:Version = "1.8.0"
 
 $ErrorActionPreference = "Stop"
 
@@ -166,6 +183,18 @@ $script:LastErrorBalloonAt       = [DateTime]::MinValue   # rate-limit watchdog 
 $script:ToastShownAt     = [DateTime]::MinValue
 $script:ToastDebounceMs  = 500
 
+# v1.8.0: toast lifecycle hardening. WinForms Timers created inside event-handler
+# closures (the fade-out / auto-dismiss chain) were previously unrooted locals -
+# they got garbage-collected and the toast stayed visible forever. All toast
+# timers now live on this script-scope root. $script:ToastDurationMs is the
+# configured hold time (toastduration, default 4000); the 250ms sweep timer
+# force-closes any toast past duration + 2.5s, so auto-dismiss is guaranteed.
+$script:ToastTimers       = New-Object System.Collections.ArrayList  # live toast timer roots
+$script:ToastDurationMs   = 4000     # ms a toast stays visible (config: toastduration)
+$script:ToastSweepGraceMs = 2500     # extra grace before the hard-deadline sweep closes a toast
+$script:ToastSweepTimer   = $null    # 250ms safety sweep timer (created once at startup)
+$script:ToastSweepIntervalMs = 250
+
 # Chrome App (PWA) shortcut diagnostics - warn once, fall back to a browser tab.
 $script:ChromeAppLnkWarned = $false
 
@@ -259,14 +288,16 @@ public static class DshDwm {
 }
 
 // Fluent-ish color table so the ContextMenuStrip follows light/dark cleanly.
+// v1.8.0 dark pass: deeper, Fluent/VSCode-like dark surfaces with a subtle
+// accent-tinted hover and a crisp border for dropdown definition.
 public sealed class DshFluentColorTable : ProfessionalColorTable {
     public bool Dark;
-    private Color MenuBg()    { return Dark ? Color.FromArgb(32, 32, 32) : Color.White; }
-    private Color Hover()     { return Dark ? Color.FromArgb(62, 62, 62) : Color.FromArgb(229, 243, 255); }
-    private Color Border()    { return Dark ? Color.FromArgb(45, 45, 45) : Color.FromArgb(0, 0, 0, 0); }
-    private Color Sep()       { return Dark ? Color.FromArgb(58, 58, 58) : Color.FromArgb(0, 0, 0, 0); }
+    private Color MenuBg()    { return Dark ? Color.FromArgb(28, 28, 30)  : Color.White; }
+    private Color Hover()     { return Dark ? Color.FromArgb(55, 60, 66)  : Color.FromArgb(229, 243, 255); }
+    private Color Border()    { return Dark ? Color.FromArgb(62, 66, 72) : Color.FromArgb(0, 0, 0, 0); }
+    private Color Sep()       { return Dark ? Color.FromArgb(48, 51, 56)  : Color.FromArgb(0, 0, 0, 0); }
 
-    public override Color ToolStripDropDownBackground { get { return Dark ? Color.FromArgb(38,38,38) : Color.White; } }
+    public override Color ToolStripDropDownBackground { get { return Dark ? Color.FromArgb(33,33,35) : Color.White; } }
     public override Color ImageMarginGradientBegin   { get { return MenuBg(); } }
     public override Color ImageMarginGradientMiddle  { get { return MenuBg(); } }
     public override Color ImageMarginGradientEnd     { get { return MenuBg(); } }
@@ -396,6 +427,9 @@ function Resolve-UiFont {
 function Apply-FluentThemeToMenu {
     # Theme a ContextMenuStrip (and all nested ToolStripItems, except images)
     # with the fluent color table + text colours, matching the resolved theme.
+    # v1.8.0: recurses into dropdowns and re-renders MDL2 glyph images from the
+    # code stored in each item's Tag, so a live theme switch recolours icons
+    # too (they would otherwise keep the previous theme's foreground).
     param(
         [System.Windows.Forms.ContextMenuStrip]$Menu
     )
@@ -404,9 +438,34 @@ function Apply-FluentThemeToMenu {
         $ct = New-Object DshFluentColorTable
         $ct.Dark = $dark
         $Menu.Renderer = New-Object System.Windows.Forms.ToolStripProfessionalRenderer($ct)
-        $fg = if ($dark) { [System.Drawing.Color]::FromArgb(235, 235, 235) } else { [System.Drawing.Color]::FromArgb(32, 32, 32) }
+        $fg   = if ($dark) { [System.Drawing.Color]::FromArgb(238, 238, 238) } else { [System.Drawing.Color]::FromArgb(28, 28, 28) }
+        $icon = if ($dark) { [System.Drawing.Color]::FromArgb(198, 204, 210) } else { [System.Drawing.Color]::FromArgb(88, 88, 88) }
+
+        function Set-Theme-OnItem([System.Windows.Forms.ToolStripItem]$Item) {
+            try {
+                $Item.ForeColor = $fg
+                $tag = $Item.Tag
+                if ($tag -is [hashtable] -and $tag.ContainsKey('Glyph')) {
+                    # Items with an explicit icon colour (e.g. the red Exit
+                    # glyph) keep it across themes; the rest follow the theme.
+                    $glyphFore = if ($tag.ContainsKey('Fore')) { $tag['Fore'] } else { $icon }
+                    $Item.Image = New-GlyphImage -Code ([int]$tag['Glyph']) -Fore $glyphFore
+                }
+            } catch { }
+            if ($Item -is [System.Windows.Forms.ToolStripMenuItem]) {
+                $dd = $Item.DropDown
+                if ($dd -is [System.Windows.Forms.ContextMenuStrip]) {
+                    $subCt = New-Object DshFluentColorTable
+                    $subCt.Dark = $dark
+                    $dd.Renderer = New-Object System.Windows.Forms.ToolStripProfessionalRenderer($subCt)
+                }
+                foreach ($sub in $Item.DropDownItems) {
+                    Set-Theme-OnItem -Item $sub
+                }
+            }
+        }
         foreach ($item in $Menu.Items) {
-            try { $item.ForeColor = $fg } catch { }
+            Set-Theme-OnItem -Item $item
         }
     } catch { }
 }
@@ -490,38 +549,102 @@ function Show-Balloon {
 
 $script:ToastForm = $null     # currently visible toast form (only one at a time)
 
+function Register-ToastTimer {
+    # Root a toast lifecycle timer on the script scope so it can never be
+    # garbage-collected while running (the v1.8.0 hang fix).
+    param([System.Windows.Forms.Timer]$Timer)
+    if ($Timer) { try { [void]$script:ToastTimers.Add($Timer) } catch { } }
+}
+
+function Unregister-ToastTimer {
+    param([System.Windows.Forms.Timer]$Timer)
+    if ($Timer) { try { [void]$script:ToastTimers.Remove($Timer) } catch { } }
+}
+
+function Test-ToastDeadlineExceeded {
+    # Pure deadline check for the hard-lifetime sweep: a toast is force-closed
+    # once it has been visible for more than DurationMs + GraceMs. Kept pure so
+    # the sweep logic is unit-testable.
+    param(
+        [datetime]$ShownAt,
+        [datetime]$Now,
+        [int]$DurationMs,
+        [int]$GraceMs = 2500
+    )
+    if ($ShownAt -eq [DateTime]::MinValue -or $DurationMs -lt 0) { return $false }
+    return (($Now - $ShownAt).TotalMilliseconds -gt ($DurationMs + $GraceMs))
+}
+
+function Dismiss-Toast {
+    # Kill a toast's lifecycle timers (if any) and close the form immediately.
+    # Used by the hard-deadline sweep and by the "close" affordances so a stale
+    # auto-dismiss tick can never double-fire on a closing/disposed form.
+    param([System.Windows.Forms.Form]$Form)
+    if (-not $Form -or $Form.IsDisposed) { return }
+    try {
+        $ctx = $Form.Tag
+        if ($ctx) {
+            if ($ctx.CloseTimer) { try { $ctx.CloseTimer.Stop() } catch { }; Unregister-ToastTimer $ctx.CloseTimer; $ctx.CloseTimer = $null }
+            if ($ctx.FadeTimer)  { try { $ctx.FadeTimer.Stop() }  catch { }; Unregister-ToastTimer $ctx.FadeTimer;  $ctx.FadeTimer = $null }
+        }
+        try { $Form.Close() } catch { }
+    } catch { }
+}
+
 function Close-Toast {
     # Close a toast form, optionally with a fade-out (symmetric with the
     # fade-in). The fade runs on its own timer so the UI thread never blocks.
+    # v1.8.0: the fade timer is rooted BOTH in the script-scope registry and in
+    # the toast's context bag (form.Tag) - an unrooted local timer here was the
+    # root cause of toasts hanging on screen forever.
     param(
         [System.Windows.Forms.Form]$Form,
         [bool]$Fade = $true
     )
     if (-not $Form) { return }
+    try { if ($Form.IsDisposed) { return } } catch { return }
+    if ($script:DebugLog) { $script:DebugLog.Add("CLOSE-TOAST entered fade=$Fade") | Out-Null }
     if (-not $Fade) {
-        try { $Form.Close() } catch { }
+        Dismiss-Toast -Form $Form
         return
     }
     try {
         $fadeTimer = New-Object System.Windows.Forms.Timer
         $fadeTimer.Tag = $Form
         $fadeTimer.Interval = 24
+        Register-ToastTimer $fadeTimer
+        try { $Form.Tag.FadeTimer = $fadeTimer } catch { }
+        if ($script:DebugLog) { $script:DebugLog.Add("CLOSE-TOAST fadeTimer created, adding tick") | Out-Null }
         $fadeTimer.add_Tick({
             $ft = $this
             $ff = $ft.Tag
+            if ($script:DebugLog) { $script:DebugLog.Add("fade-tick entered; fadeTimerNull=$($null -eq $ft) formNull=$($null -eq $ff) opacity=$($ff.Opacity)") | Out-Null }
             try {
                 $ff.Opacity = [Math]::Max(0, $ff.Opacity - 0.18)
+                if ($script:DebugLog) { $script:DebugLog.Add("fade-tick opacity now $($ff.Opacity)") | Out-Null }
                 if ($ff.Opacity -le 0) {
                     $ft.Stop()
+                    Unregister-ToastTimer $ft
+                    if ($script:DebugLog) { $script:DebugLog.Add("fade-tick closing form") | Out-Null }
+                    try { $ff.Tag.FadeTimer = $null } catch { }
                     try { $ff.Close() } catch { }
                 }
             } catch {
+                if ($script:DebugLog) { $script:DebugLog.Add("fade-tick EXCEPTION: $($_.Exception.Message)") | Out-Null }
                 try { $ft.Stop() } catch { }
+                Unregister-ToastTimer $ft
+                try { $ff.Tag.FadeTimer = $null } catch { }
+                # A fade that cannot run (e.g. the form is already gone) must
+                # still end with the form closed - never leave a zombie toast.
+                try { $ff.Close() } catch { }
             }
         })
         $fadeTimer.Start()
+        if ($script:DebugLog) { $script:DebugLog.Add("CLOSE-TOAST fadeTimer started") | Out-Null }
     }
     catch {
+        if ($script:DebugLog) { $script:DebugLog.Add("CLOSE-TOAST CATCH: $($_.Exception.Message)") | Out-Null }
+        # Last resort: the fade itself could not be armed - close right away.
         try { $Form.Close() } catch { }
     }
 }
@@ -542,10 +665,12 @@ function Show-Toast {
 
     $dark = Resolve-MenuTheme
     $accent = Get-AccentColor
-    $bg        = if ($dark) { [System.Drawing.Color]::FromArgb(32, 32, 32) }       else { [System.Drawing.Color]::White }
-    $fg        = if ($dark) { [System.Drawing.Color]::FromArgb(235, 235, 235) }    else { [System.Drawing.Color]::FromArgb(32, 32, 32) }
-    $fgDim     = if ($dark) { [System.Drawing.Color]::FromArgb(160, 160, 160) }    else { [System.Drawing.Color]::FromArgb(110, 110, 110) }
-    $closeHov  = if ($dark) { [System.Drawing.Color]::FromArgb(60, 60, 60) }       else { [System.Drawing.Color]::FromArgb(235, 235, 235) }
+    # v1.8.0 dark palette: near-black surface, high-contrast title, soft dim
+    # body text and a subtle hover for the close button (VSCode/Fluent-like).
+    $bg        = if ($dark) { [System.Drawing.Color]::FromArgb(30, 30, 32) }     else { [System.Drawing.Color]::White }
+    $fg        = if ($dark) { [System.Drawing.Color]::FromArgb(240, 240, 242) }  else { [System.Drawing.Color]::FromArgb(30, 30, 30) }
+    $fgDim     = if ($dark) { [System.Drawing.Color]::FromArgb(158, 162, 168) }  else { [System.Drawing.Color]::FromArgb(110, 110, 110) }
+    $closeHov  = if ($dark) { [System.Drawing.Color]::FromArgb(58, 62, 68) }     else { [System.Drawing.Color]::FromArgb(238, 238, 238) }
 
     switch ($Kind) {
         ([System.Windows.Forms.ToolTipIcon]::Warning) { $bar = [System.Drawing.Color]::FromArgb(246, 191, 38) }
@@ -568,7 +693,16 @@ function Show-Toast {
                 return
             }
         } catch { }
-        # Outside the debounce window: fade the old toast out first.
+        # Outside the debounce window: stop the old toast's auto-dismiss timer
+        # first (a stale tick must not double-fire on a closing form), then fade
+        # the old toast out; a fresh toast is built below.
+        $oldCtx = $null
+        try { $oldCtx = $script:ToastForm.Tag } catch { }
+        if ($oldCtx -and $oldCtx.CloseTimer) {
+            try { $oldCtx.CloseTimer.Stop() } catch { }
+            Unregister-ToastTimer $oldCtx.CloseTimer
+            try { $oldCtx.CloseTimer = $null } catch { }
+        }
         Close-Toast -Form $script:ToastForm -Fade $true
     }
 
@@ -600,7 +734,7 @@ function Show-Toast {
     # delegates do NOT reliably capture local variables once the defining
     # function returns, so referencing $form here would break (e.g. the
     # asynchronous Shown/Tick/Click handlers crash on 'property not found').
-    $ctx = @{ Form = $form; CloseHov = $closeHov; Whale = $whaleImg; CloseTimer = $null }
+    $ctx = @{ Form = $form; CloseHov = $closeHov; Whale = $whaleImg; CloseTimer = $null; FadeTimer = $null }
     $form.Tag = $ctx
 
     # Accent bar (left).
@@ -686,6 +820,7 @@ function Show-Toast {
         $animTimer = New-Object System.Windows.Forms.Timer
         $animTimer.Tag = $f
         $animTimer.Interval = 32
+        Register-ToastTimer $animTimer
         $animTimer.add_Tick({
             # $this is the animation timer; the form rides on .Tag.
             $timer = $this
@@ -694,12 +829,16 @@ function Show-Toast {
                 $ff.Opacity = [Math]::Min(1.0, $ff.Opacity + 0.14)
                 if ($ff.Opacity -ge 1.0) {
                     $timer.Stop()
+                    Unregister-ToastTimer $timer
                     $closeTimer = New-Object System.Windows.Forms.Timer
                     $closeTimer.Tag = $ff
-                    $closeTimer.Interval = 4000
+                    $closeTimer.Interval = $script:ToastDurationMs
+                    Register-ToastTimer $closeTimer
                     $closeTimer.add_Tick({
+                        if ($script:DebugLog) { $script:DebugLog.Add("closetimer TICK") | Out-Null }
                         try {
                             $this.Stop()
+                            Unregister-ToastTimer $this
                             $tf = $this.Tag
                             Close-Toast -Form $tf -Fade $true
                         } catch { }
@@ -711,13 +850,20 @@ function Show-Toast {
                 }
             } catch {
                 try { $timer.Stop() } catch { }
+                Unregister-ToastTimer $timer
             }
         })
         $animTimer.Start()
     })
     $form.add_Closed({
         if ($script:ToastForm -eq $this) { $script:ToastForm = $null }
-        try { if ($this.Tag.Whale) { $this.Tag.Whale.Dispose() } } catch { }
+        # Release any still-registered lifecycle timers of this toast.
+        try {
+            $ct = $this.Tag
+            if ($ct.CloseTimer) { Unregister-ToastTimer $ct.CloseTimer }
+            if ($ct.FadeTimer)  { Unregister-ToastTimer $ct.FadeTimer }
+            if ($ct.Whale)      { $ct.Whale.Dispose() }
+        } catch { }
     })
 
     $script:ToastShownAt = Get-Date
@@ -1160,6 +1306,10 @@ function Read-Config {
         menutheme            = "auto"   # auto | light | dark (auto follows the system)
         toastson             = $true    # true -> modern Win11 toasts; false -> classic balloon
         menubicons           = $true    # show MDL2 glyph icons on menu items
+        # --- v1.8.0: toast lifetime ---
+        # How long a toast stays visible before auto-dismissing (ms). The
+        # hard-deadline sweep closes it at duration + 2500ms no matter what.
+        toastduration        = 4000
         # --- v1.6.0: unified smooth fonts + dsh update checks ---
         uifont               = "Segoe UI Variable Text"  # menu + toast font (falls back to Segoe UI)
         uifontsize           = 9        # base body font size (pt) for menu + toasts
@@ -1205,6 +1355,7 @@ function Read-Config {
     $cfg['updateintervalhours']   = [int](Assert-ConfigNumeric -Key 'updateintervalhours' -Value $cfg['updateintervalhours'] -Default 24 -Min 0 -Max 8760)
     $cfg['uifontsize']            = [int](Assert-ConfigNumeric -Key 'uifontsize' -Value $cfg['uifontsize'] -Default 9 -Min 6 -Max 72)
     $cfg['maxconsecutiverestarts'] = [int](Assert-ConfigNumeric -Key 'maxconsecutiverestarts' -Value $cfg['maxconsecutiverestarts'] -Default 10 -Min 1 -Max 1000)
+    $cfg['toastduration']         = [int](Assert-ConfigNumeric -Key 'toastduration' -Value $cfg['toastduration'] -Default 4000 -Min 1000 -Max 60000)
 
     # URL fields are derived from the port unless explicitly set.
     $cfg['healthurl']    = "http://127.0.0.1:$($cfg['port'])/"
@@ -1245,6 +1396,12 @@ function Init-I18n {
             MenuExit            = "退出"
             MenuCopyLog         = "复制最近日志"
             MenuAutostart       = "开机自启"
+            MenuTheme           = "主题"
+            MenuThemeAuto       = "自动"
+            MenuThemeLight      = "浅色"
+            MenuThemeDark       = "深色"
+            BalloonTheme        = "主题已切换"
+            BalloonThemeApplied = "主题: {0}"
             MenuAgents          = "代理 (Agents)"
             MenuAgentsNone      = "(无运行中代理)"
             MenuAgentsWaiting   = "等待输入"
@@ -1298,6 +1455,12 @@ function Init-I18n {
             MenuExit            = "Exit"
             MenuCopyLog         = "Copy Recent Log"
             MenuAutostart       = "Start with Windows"
+            MenuTheme           = "Theme"
+            MenuThemeAuto       = "Auto"
+            MenuThemeLight      = "Light"
+            MenuThemeDark       = "Dark"
+            BalloonTheme        = "dsh theme"
+            BalloonThemeApplied = "theme: {0}"
             MenuAgents          = "Agents"
             MenuAgentsNone      = "(no running agents)"
             MenuAgentsWaiting   = "waiting for input"
@@ -1351,6 +1514,12 @@ function Init-I18n {
             MenuExit            = "Выход"
             MenuCopyLog         = "Скопировать лог"
             MenuAutostart       = "Автозапуск с Windows"
+            MenuTheme           = "Тема"
+            MenuThemeAuto       = "Авто"
+            MenuThemeLight      = "Светлая"
+            MenuThemeDark       = "Тёмная"
+            BalloonTheme        = "Тема приложения"
+            BalloonThemeApplied = "тема: {0}"
             MenuAgents          = "Агенты"
             MenuAgentsNone      = "(нет запущенных агентов)"
             MenuAgentsWaiting   = "ждёт ввода"
@@ -3013,6 +3182,7 @@ $script:DshLogFile = Resolve-TrayPath ([string]$script:Config.dshlogfile)
 $script:HealthIntervalSeconds = [int]$script:Config.healthintervalseconds
 $script:StartupGraceSeconds = [int]$script:Config.startupgraceseconds
 $script:RestartDelaySeconds = [int]$script:Config.restartdelayseconds
+$script:ToastDurationMs = [int]$script:Config.toastduration
 Init-I18n
 
 # Compile the P/Invoke + fluent color table types used by the modern UI/toasts.
@@ -3040,7 +3210,7 @@ if (-not $createdNew) {
 try {
     Write-TrayLog "Tray application starting (Windows-native dsh) port=$($script:Port) v$($script:Version) lang=$($script:Lang)"
     Write-TrayLog "boot manifest: pid=$PID ps=$($PSVersionTable.PSVersion) os=$([Environment]::OSVersion.VersionString) tray=$($script:TrayRoot) startscript=$($script:StartScript) dshlog=$($script:DshLogFile) healthurl=$($script:HealthUrl) mutex=$mutexName"
-    Write-TrayLog "config: port=$($script:Port) healthinterval=$($script:HealthIntervalSeconds)s grace=$($script:StartupGraceSeconds)s restartdelay=$($script:RestartDelaySeconds)s maxrestarts=$($script:Config.maxconsecutiverestarts) healthconfirmations=$($script:Config.healthconfirmations) healthdebounce=$($script:Config.healthdebounceseconds)s lang=$($script:Lang) notifications=$($script:Config.notifications) whaleicon=$($script:Config.whaleicon) agentmonitor=$($script:Config.agentmonitor) agentpoll=$($script:Config.agentpollseconds)s badgeicon=$($script:Config.badgeicon) updatecheck=$($script:Config.updatecheck) updateintervalh=$($script:Config.updateintervalhours) toastson=$($script:Config.toastson) menubicons=$($script:Config.menubicons)"
+    Write-TrayLog "config: port=$($script:Port) healthinterval=$($script:HealthIntervalSeconds)s grace=$($script:StartupGraceSeconds)s restartdelay=$($script:RestartDelaySeconds)s maxrestarts=$($script:Config.maxconsecutiverestarts) healthconfirmations=$($script:Config.healthconfirmations) healthdebounce=$($script:Config.healthdebounceseconds)s lang=$($script:Lang) notifications=$($script:Config.notifications) whaleicon=$($script:Config.whaleicon) agentmonitor=$($script:Config.agentmonitor) agentpoll=$($script:Config.agentpollseconds)s badgeicon=$($script:Config.badgeicon) updatecheck=$($script:Config.updatecheck) updateintervalh=$($script:Config.updateintervalhours) toastson=$($script:Config.toastson) toastduration=$($script:ToastDurationMs) theme=$($script:Config.menutheme) menubicons=$($script:Config.menubicons)"
 
     $script:Context = New-Object System.Windows.Forms.ApplicationContext
     $script:NotifyIcon = New-Object System.Windows.Forms.NotifyIcon
@@ -3092,11 +3262,23 @@ try {
         }
     } catch { }
 
-    function Set-ItemIcon([System.Windows.Forms.ToolStripItem]$Item, [System.Drawing.Image]$Img) {
-        if ($script:Config.menubicons -and $Img) { $Item.Image = $Img }
+    function Set-ItemIcon([System.Windows.Forms.ToolStripItem]$Item, [int]$Code = 0, [System.Drawing.Image]$Img = $null, [System.Drawing.Color]$Fore = ([System.Drawing.Color]::Empty)) {
+        if ($script:Config.menubicons) {
+            $f = if ($Fore -ne [System.Drawing.Color]::Empty) { $Fore } else { $script:_IconFg }
+            if ($Code -ne 0) {
+                # Keep the glyph code (and any explicit colour) in Item.Tag so a
+                # live theme switch can re-render the icon for the new theme.
+                $Item.Tag = @{ Glyph = $Code; Fore = $f }
+                $Item.Image = New-GlyphImage -Code $Code -Fore $f
+            }
+            elseif ($Img) {
+                $Item.Image = $Img
+            }
+        }
         $Item.ForeColor = $script:_ItemFg
     }
     $script:_ItemFg = $itemFg
+    $script:_IconFg = $iconFg
 
     # Status row: welcome header with the whale + current language-neutral text.
     $script:StatusItem = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -3117,7 +3299,7 @@ try {
     $newChatItem = New-Object System.Windows.Forms.ToolStripMenuItem
     $newChatItem.Text = $script:L.MenuNewChat
     $newChatItem.add_Click({ Start-NewConversation })
-    Set-ItemIcon -Item $newChatItem -Img (New-GlyphImage -Code 0xE8F1 -Fore $iconFg)
+    Set-ItemIcon -Item $newChatItem -Code 0xE8F1
     [void]$menu.Items.Add($newChatItem)
     # v1.7.1: the async new-conversation job toggles this item disabled/"..."
     # while it is in flight.
@@ -3128,7 +3310,7 @@ try {
     $restartItem = New-Object System.Windows.Forms.ToolStripMenuItem
     $restartItem.Text = $script:L.MenuRestart
     $restartItem.add_Click({ Restart-DshProxy })
-    Set-ItemIcon -Item $restartItem -Img (New-GlyphImage -Code 0xE895 -Fore $iconFg)
+    Set-ItemIcon -Item $restartItem -Code 0xE895
     [void]$menu.Items.Add($restartItem)
 
     $stopItem = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -3139,7 +3321,7 @@ try {
         Set-TrayStatus -Text $script:L.StatusStopped -State Stopped
         Show-Balloon -Title $script:L.BalloonStopped -Text "dsh :$($script:Port)"
     })
-    Set-ItemIcon -Item $stopItem -Img (New-GlyphImage -Code 0xE71A -Fore $iconFg)
+    Set-ItemIcon -Item $stopItem -Code 0xE71A
     [void]$menu.Items.Add($stopItem)
 
     # Exit: stop the server (if running) and fully close the tray app itself.
@@ -3151,13 +3333,14 @@ try {
         try { if ($script:AgentTimer) { $script:AgentTimer.Stop() } } catch { }
         try { if ($script:UpdateTimer) { $script:UpdateTimer.Stop() } } catch { }
         try { if ($script:Timer) { $script:Timer.Stop() } } catch { }
+        try { if ($script:ToastSweepTimer) { $script:ToastSweepTimer.Stop() } } catch { }
         if ($script:NotifyIcon) {
             try { $script:NotifyIcon.Visible = $false } catch { }
         }
         Write-TrayLog "Tray exiting on user request (uptime=$([int]((Get-Date) - $script:TrayStartedAt).TotalSeconds)s restarts=$($script:RestartCount) healthFailures=$($script:HealthFailures) agentsSeen=$($script:AgentCount))"
         [System.Windows.Forms.Application]::Exit()
     })
-    Set-ItemIcon -Item $exitItem -Img (New-GlyphImage -Code 0xE711 -Fore ([System.Drawing.Color]::FromArgb(212, 60, 60)))
+    Set-ItemIcon -Item $exitItem -Code 0xE711 -Fore ([System.Drawing.Color]::FromArgb(212, 60, 60))
     [void]$menu.Items.Add($exitItem)
 
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
@@ -3165,7 +3348,7 @@ try {
     $copyLogItem = New-Object System.Windows.Forms.ToolStripMenuItem
     $copyLogItem.Text = $script:L.MenuCopyLog
     $copyLogItem.add_Click({ Copy-RecentLog })
-    Set-ItemIcon -Item $copyLogItem -Img (New-GlyphImage -Code 0xE8C8 -Fore $iconFg)
+    Set-ItemIcon -Item $copyLogItem -Code 0xE8C8
     [void]$menu.Items.Add($copyLogItem)
 
     $autoItem = New-Object System.Windows.Forms.ToolStripMenuItem
@@ -3179,8 +3362,48 @@ try {
             Set-Autostart -Enable $autoItem.Checked
         }
     })
-    Set-ItemIcon -Item $autoItem -Img (New-GlyphImage -Code 0xE7E8 -Fore $iconFg)
+    Set-ItemIcon -Item $autoItem -Code 0xE7E8
     [void]$menu.Items.Add($autoItem)
+
+    # Theme (v1.8.0): switch Auto / Light / Dark live. The choice is persisted
+    # to dsh-tray.json and the menu + toasts re-theme immediately - no restart.
+    $themeHost = New-Object System.Windows.Forms.ToolStripMenuItem
+    $themeHost.Text = $script:L.MenuTheme
+    $themeHost.ForeColor = $itemFg
+    Set-ItemIcon -Item $themeHost -Code 0xE790
+    $themeItems = New-Object System.Collections.ArrayList
+    foreach ($mode in @('auto', 'light', 'dark')) {
+        $mi = New-Object System.Windows.Forms.ToolStripMenuItem
+        $mi.Text = switch ($mode) {
+            'auto'  { $script:L.MenuThemeAuto }
+            'light' { $script:L.MenuThemeLight }
+            'dark'  { $script:L.MenuThemeDark }
+        }
+        $mi.Tag = $mode
+        $mi.CheckOnClick = $true
+        if ([string]$script:Config.menutheme -eq $mode) { $mi.Checked = $true }
+        $mi.add_Click({
+            $clicked = $this
+            foreach ($ti in $themeItems) { if ($ti -ne $clicked) { $ti.Checked = $false } }
+            $script:Config.menutheme = [string]$clicked.Tag
+            # Persist the choice (best-effort, preserving every other key).
+            try {
+                $cfgPath = Join-Path $script:TrayRoot "dsh-tray.json"
+                if (Test-Path -LiteralPath $cfgPath) {
+                    $j = Get-Content -LiteralPath $cfgPath -Raw | ConvertFrom-Json
+                    $j.menutheme = $script:Config.menutheme
+                    $j | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $cfgPath -Encoding UTF8
+                }
+            } catch { Write-TrayLog "WARN could not persist menutheme: $($_.Exception.Message)" }
+            Apply-FluentThemeToMenu -Menu $menu
+            if ($script:AgentMenu) { Apply-FluentThemeToMenu -Menu $script:AgentMenu }
+            Write-TrayLog "theme: $($script:Config.menutheme)"
+            Show-Balloon -Title $script:L.BalloonTheme -Text ($script:L.BalloonThemeApplied -f $script:Config.menutheme)
+        })
+        [void]$themeItems.Add($mi)
+        [void]$themeHost.DropDownItems.Add($mi)
+    }
+    [void]$menu.Items.Add($themeHost)
 
     # Update section (v1.6.0): check + one-click apply for @deepseek-ai/dsh.
     if ($script:Config.updatecheck) {
@@ -3189,14 +3412,14 @@ try {
         $script:UpdateCheckItem = New-Object System.Windows.Forms.ToolStripMenuItem
         $script:UpdateCheckItem.Text = $script:L.MenuCheckUpdates
         $script:UpdateCheckItem.add_Click({ Invoke-DshUpdateCheck -Manual $true })
-        Set-ItemIcon -Item $script:UpdateCheckItem -Img (New-GlyphImage -Code 0xE8E0 -Fore $iconFg)
+        Set-ItemIcon -Item $script:UpdateCheckItem -Code 0xE8E0
         [void]$menu.Items.Add($script:UpdateCheckItem)
 
         $script:UpdateApplyItem = New-Object System.Windows.Forms.ToolStripMenuItem
         $script:UpdateApplyItem.Text = $script:L.MenuUpdateNow.Replace('{0}', "?")
         $script:UpdateApplyItem.Enabled = $false
         $script:UpdateApplyItem.add_Click({ Invoke-DshUpdate })
-        Set-ItemIcon -Item $script:UpdateApplyItem -Img (New-GlyphImage -Code 0xE895 -Fore $iconFg)
+        Set-ItemIcon -Item $script:UpdateApplyItem -Code 0xE895
         [void]$menu.Items.Add($script:UpdateApplyItem)
     }
 
@@ -3205,7 +3428,7 @@ try {
         $script:AgentMenuHost = New-Object System.Windows.Forms.ToolStripMenuItem
         $script:AgentMenuHost.Text = $script:L.MenuAgents
         $script:AgentMenuHost.ForeColor = $itemFg
-        Set-ItemIcon -Item $script:AgentMenuHost -Img (New-GlyphImage -Code 0xE716 -Fore $iconFg)
+        Set-ItemIcon -Item $script:AgentMenuHost -Code 0xE716
         $script:AgentMenu = New-Object System.Windows.Forms.ContextMenuStrip
         $script:AgentMenuHost.DropDown = $script:AgentMenu
         [void]$menu.Items.Add($script:AgentMenuHost)
@@ -3244,6 +3467,29 @@ try {
         try { Invoke-MonitorTick } catch { Write-TrayLog "ERROR monitor tick: $($_.Exception.Message)" }
     })
     $script:Timer.Start()
+
+    # Toast safety sweep (v1.8.0): a script-scope rooted timer that force-closes
+    # any toast past its hard deadline (duration + sweep grace). Even if a toast's
+    # own fade/auto-dismiss timers are ever starved, no toast can stay on screen
+    # forever - this is the guaranteed-tight upper bound on toast lifetime.
+    $script:ToastSweepTimer = New-Object System.Windows.Forms.Timer
+    $script:ToastSweepTimer.Interval = $script:ToastSweepIntervalMs
+    $script:ToastSweepTimer.add_Tick({
+        try {
+            $t = $script:ToastForm
+            if (-not $t) { return }
+            if (Test-ToastDeadlineExceeded -ShownAt $script:ToastShownAt -Now (Get-Date) -DurationMs $script:ToastDurationMs -GraceMs $script:ToastSweepGraceMs) {
+                try {
+                    if (-not $t.IsDisposed -and $t.Visible) {
+                        Write-TrayLog "toast sweep: force-closing a toast past its lifetime (duration=$($script:ToastDurationMs)ms)"
+                        Dismiss-Toast -Form $t
+                    }
+                } catch { }
+            }
+        } catch { }
+    })
+    $script:ToastSweepTimer.Start()
+    Write-TrayLog "Toast sweep enabled: interval=$($script:ToastSweepIntervalMs)ms duration=$($script:ToastDurationMs)ms grace=$($script:ToastSweepGraceMs)ms"
 
     # Dedicated agent-poll timer (v1.4.0). Runs independently of the 1s watchdog.
     if ($script:Config.agentmonitor) {
