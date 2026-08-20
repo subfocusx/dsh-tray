@@ -1,7 +1,29 @@
 ﻿# =============================================================================
 # dsh-tray.ps1 - DeepSeek Harness (dsh web) Windows-native tray controller
 #
-# Version: 1.8.0
+# Version: 1.9.0
+#
+# 1.9.0 (notification overhaul: stacked toasts + history):
+#   - Toasts no longer overlap each other. The old model had ONE toast that
+#     cross-faded a new one over the old one at the same spot (both semi-
+#     transparent top-most windows) - that "stacking/overlap" look is gone.
+#     Notifications now run on a *stack* of up to toastmax (default 4) toasts
+#     laid out vertically in the top-right corner - each event gets its own
+#     slot, so nothing overlaps and nothing replaces the previous event.
+#   - New toasts slide in from the right with an ease-out fade; existing toasts
+#     shift down smoothly when a new one arrives; closing fades out with a
+#     slight upward slide. Every timer stays rooted (no GC-hang, no zombie).
+#   - Richer design: per-kind icon (info/warning/error) in a tinted circle,
+#     accent bar, HH:mm timestamp, rounded corners (DWM + CreateRoundRectRgn
+#     fallback) and a subtle translucency (toasttranslucent, acrylic/mica
+#     attempt with a solid theme-colour fallback).
+#   - Action button per event (toastactions): Open dashboard / Restart dsh /
+#     Update, plus click-on-body opens the dashboard as before.
+#   - New "Notifications" menu: the last toasthistory (default 20) events
+#     survive the toast itself (time + title + body, click opens the panel).
+#   - New config: toastmax, toastactions, toasthistory, toasttranslucent.
+#   - Pure layout/debounce/history logic is unit-tested (Pester); manual
+#     tests\manual\toast-harness6.ps1 drives the real stack.
 #
 # 1.8.0 (notifications + dark design):
 #   - FIXED: toasts no longer stay on screen forever. The auto-dismiss chain
@@ -85,7 +107,7 @@
 # tray process (taskkill /PID <tray-pid> /F).
 # =============================================================================
 
-$script:Version = "1.8.0"
+$script:Version = "1.9.0"
 
 $ErrorActionPreference = "Stop"
 
@@ -180,7 +202,6 @@ $script:LastErrorBalloonAt       = [DateTime]::MinValue   # rate-limit watchdog 
 
 # Toast debounce: rapid successive events update the visible toast instead of
 # recreating it (the startup "blinking" flicker).
-$script:ToastShownAt     = [DateTime]::MinValue
 $script:ToastDebounceMs  = 500
 
 # v1.8.0: toast lifecycle hardening. WinForms Timers created inside event-handler
@@ -194,6 +215,26 @@ $script:ToastDurationMs   = 4000     # ms a toast stays visible (config: toastdu
 $script:ToastSweepGraceMs = 2500     # extra grace before the hard-deadline sweep closes a toast
 $script:ToastSweepTimer   = $null    # 250ms safety sweep timer (created once at startup)
 $script:ToastSweepIntervalMs = 250
+
+# v1.9.0: stacked toast queue + notification history. $script:Toasts is the
+# ordered stack (index 0 = newest, drawn top-most); every event gets its own
+# slot, so toasts never overlap and never replace each other. Each toast keeps
+# its own timers (all rooted via $script:ToastTimers) and its own ShownAt, so
+# the sweep enforces the lifetime per toast. $script:ToastHistory is a bounded
+# record of every notification (survives the toast itself) shown in the
+# "Notifications" menu.
+$script:Toasts = New-Object System.Collections.ArrayList
+$script:ToastMax = 4        # max simultaneous toasts (config: toastmax)
+$script:ToastHistory = New-Object System.Collections.ArrayList
+$script:ToastHistoryCap = 20    # max history entries (config: toasthistory; 0 = off)
+$script:ToastActionsEnabled = $true   # show per-event action buttons (config: toastactions)
+$script:ToastTranslucent = $true      # subtle toast translucency (config: toasttranslucent)
+$script:ToastWidth  = 360
+$script:ToastHeight = 96
+$script:ToastGap    = 10
+$script:ToastPad    = 12
+$script:NotificationMenuItem = $null  # host item for the "Notifications" submenu
+$script:NotificationMenu     = $null  # the submenu itself
 
 # Chrome App (PWA) shortcut diagnostics - warn once, fall back to a browser tab.
 $script:ChromeAppLnkWarned = $false
@@ -349,8 +390,11 @@ function Get-AccentColor {
     try {
         $deflt = (Get-ItemPropertyValue -Path "HKCU:\Software\Microsoft\Windows\DWM" -Name "AccentColor" -ErrorAction Stop)
         if ($null -ne $deflt) {
-            $a = [int]$deflt
-            # AccentColor is 0xAABBGGRR
+            # AccentColor is a DWORD 0xAABBGGRR. PowerShell surfaces it as an
+            # unsigned value when the alpha byte has the high bit set (4294967295
+            # range), which overflows a signed [int] - cast to Int64 so the
+            # accent is actually used instead of always falling back to blue.
+            $a = [int64]$deflt
             $r = $a -band 0xFF; $g = ($a -shr 8) -band 0xFF; $b = ($a -shr 16) -band 0xFF
             return [System.Drawing.Color]::FromArgb($r, $g, $b)
         }
@@ -525,13 +569,18 @@ function Show-Balloon {
     param(
         [string]$Title,
         [string]$Text,
-        [System.Windows.Forms.ToolTipIcon]$Icon = [System.Windows.Forms.ToolTipIcon]::Info
+        [System.Windows.Forms.ToolTipIcon]$Icon = [System.Windows.Forms.ToolTipIcon]::Info,
+        [string]$Action = "auto"
     )
     if (-not $script:Config -or -not $script:Config.notifications) { return }
+    # v1.9.0: every notification is recorded in the "Notifications" history
+    # menu (deduplicated), independent of whether it renders as a toast or a
+    # classic balloon.
+    Add-NotificationRecord -Title $Title -Text $Text -Kind $Icon
     $useToasts = $true
     try { $useToasts = [bool]$script:Config.toastson } catch { }
     if (($useToasts) -and $script:NotifyIcon) {
-        try { Show-Toast -Title $Title -Text $Text -Kind $Icon; return } catch {
+        try { Show-Toast -Title $Title -Text $Text -Kind $Icon -Action $Action; return } catch {
             Write-TrayLog "WARN toast failed, falling back to balloon: $($_.Exception.Message)"
         }
     }
@@ -546,8 +595,6 @@ function Show-Balloon {
         Write-TrayLog "WARN balloon failed: $($_.Exception.Message)"
     }
 }
-
-$script:ToastForm = $null     # currently visible toast form (only one at a time)
 
 function Register-ToastTimer {
     # Root a toast lifecycle timer on the script scope so it can never be
@@ -575,173 +622,305 @@ function Test-ToastDeadlineExceeded {
     return (($Now - $ShownAt).TotalMilliseconds -gt ($DurationMs + $GraceMs))
 }
 
+function Resolve-ToastKindMeta {
+    # Pure per-kind metadata for a toast: the MDL2 glyph, its colour, the
+    # accent bar colour, the tinted-circle colour and the action kind. The
+    # accent colour is injectable so tests stay deterministic (no registry).
+    param(
+        [System.Windows.Forms.ToolTipIcon]$Kind = [System.Windows.Forms.ToolTipIcon]::Info,
+        [string]$Action = "auto",
+        [object]$Accent = $null
+    )
+    $accent = if ($null -ne $Accent) { [System.Drawing.Color]$Accent } else { Get-AccentColor }
+    switch ($Kind) {
+        ([System.Windows.Forms.ToolTipIcon]::Warning) {
+            $bar = [System.Drawing.Color]::FromArgb(246, 191, 38)
+            $tint = [System.Drawing.Color]::FromArgb(246, 191, 38)
+            $glyph = 0xE7BA
+            $glyphFore = [System.Drawing.Color]::White
+        }
+        ([System.Windows.Forms.ToolTipIcon]::Error) {
+            $bar = [System.Drawing.Color]::FromArgb(232, 17, 35)
+            $tint = [System.Drawing.Color]::FromArgb(232, 17, 35)
+            $glyph = 0xE711
+            $glyphFore = [System.Drawing.Color]::White
+        }
+        default {
+            $bar = $accent
+            $tint = $accent
+            $glyph = 0xE946
+            $glyphFore = [System.Drawing.Color]::White
+        }
+    }
+    $act = "open"
+    if ($Action -ne "auto") { $act = $Action }
+    elseif ($Kind -eq [System.Windows.Forms.ToolTipIcon]::Error) { $act = "restart" }
+    return @{
+        Glyph = $glyph; GlyphFore = $glyphFore; Bar = $bar; Tint = $tint; Action = $act
+    }
+}
+
+function Get-ToastActionLabel {
+    param([string]$Action)
+    switch ($Action) {
+        "restart" { return $script:L.BalloonActionRestart }
+        "update"  { return $script:L.BalloonActionUpdate }
+        default   { return $script:L.BalloonActionOpen }
+    }
+}
+
+function Add-NotificationRecord {
+    # Bounded history of every notification (survives the toast itself, shown
+    # in the "Notifications" menu). Consecutive identical events within 30 s are
+    # deduplicated so a rapid same-event repeat does not spam the history.
+    param([string]$Title, [string]$Text, $Kind)
+    if ($script:ToastHistoryCap -le 0) { return }
+    $now = Get-Date
+    $time = $now.ToString("HH:mm")
+    if ($script:ToastHistory.Count -gt 0) {
+        $last = $script:ToastHistory[$script:ToastHistory.Count - 1]
+        try {
+            if ($last.Title -eq $Title -and $last.Text -eq $Text -and ($now - $last.At).TotalSeconds -lt 30) { return }
+        } catch { }
+    }
+    [void]$script:ToastHistory.Add(@{ Title = $Title; Text = $Text; Kind = $Kind; Time = $time; At = $now })
+    while ($script:ToastHistory.Count -gt $script:ToastHistoryCap) {
+        [void]$script:ToastHistory.RemoveAt(0)
+    }
+    Rebuild-NotificationMenu
+}
+
+function Rebuild-NotificationMenu {
+    # Rebuild the "Notifications" submenu (newest first) from the history buffer.
+    # No-op until the menu host item exists (startup / test mode).
+    if (-not $script:NotificationMenuItem -or -not $script:NotificationMenu) { return }
+    $menu = $script:NotificationMenu
+    $menu.Items.Clear()
+    Apply-FluentThemeToMenu -Menu $menu
+    if ($script:ToastHistory.Count -eq 0) {
+        $none = New-Object System.Windows.Forms.ToolStripMenuItem
+        $none.Text = $script:L.MenuNotificationsNone
+        $none.Enabled = $false
+        [void]$menu.Items.Add($none)
+    }
+    else {
+        for ($i = $script:ToastHistory.Count - 1; $i -ge 0; $i--) {
+            $h = $script:ToastHistory[$i]
+            $item = New-Object System.Windows.Forms.ToolStripMenuItem
+            $item.Text = ("{0}  {1}" -f $h.Time, $h.Title)
+            $item.ToolTipText = $h.Text
+            $item.add_Click({ Start-DshApp })
+            [void]$menu.Items.Add($item)
+        }
+        [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+        $clear = New-Object System.Windows.Forms.ToolStripMenuItem
+        $clear.Text = $script:L.MenuNotificationsClear
+        $clear.add_Click({ $script:ToastHistory.Clear(); Rebuild-NotificationMenu })
+        [void]$menu.Items.Add($clear)
+    }
+}
+
+function Test-ToastShouldUpdateInPlace {
+    # Debounce decision: the *top* toast is updated in place (instead of a new
+    # toast) when it is still young (within ToastDebounceMs) and it is the same
+    # event kind - this kills the startup "blinking" flicker from rapid
+    # successive transitions of the same type.
+    param([System.Windows.Forms.ToolTipIcon]$Kind, [datetime]$Now)
+    if ($script:Toasts.Count -eq 0) { return $false }
+    $top = $script:Toasts[0]
+    if ($null -eq $top) { return $false }
+    # A closing toast must never be resurrected in place; an entering toast,
+    # however, is updated safely (its enter animation finishes with the new
+    # text) - this keeps the startup debounce working for rapid transitions.
+    if ($top.Closing) { return $false }
+    try { if ($top.Kind -ne $Kind) { return $false } } catch { return $false }
+    try {
+        return (($Now - $top.ShownAt).TotalMilliseconds -lt $script:ToastDebounceMs)
+    }
+    catch { return $false }
+}
+
+function New-ToastSlotLayout {
+    # Pure layout for the toast stack: vertical slots in the top-right corner,
+    # newest first. Each toast gets its own slot so toasts never overlap.
+    param(
+        [int]$Count,
+        [System.Drawing.Rectangle]$WorkingArea,
+        [int]$Width = 360,
+        [int]$Height = 96,
+        [int]$Gap = 10,
+        [int]$Pad = 12
+    )
+    $pts = New-Object System.Collections.ArrayList
+    for ($i = 0; $i -lt $Count; $i++) {
+        $x = $WorkingArea.Right - $Width - $Pad
+        $y = $WorkingArea.Top + $Pad + $i * ($Height + $Gap)
+        [void]$pts.Add((New-Object System.Drawing.Point($x, $y)))
+    }
+    return @($pts)
+}
+
+function Select-ToastStackTrim {
+    # Pure: which records to drop when a new toast pushes the stack past Max.
+    # Returns the oldest records (the tail) without mutating the stack.
+    param($Stack, [int]$Max)
+    $drop = @()
+    for ($i = $Max; $i -lt $Stack.Count; $i++) { $drop += $Stack[$i] }
+    return $drop
+}
+
+function Stop-ToastTimers {
+    # Stop + unroot every lifecycle timer of a toast record (enter, auto-close,
+    # shift, exit). Idempotent; safe to call more than once.
+    param($Record)
+    if (-not $Record) { return }
+    foreach ($name in @('AnimTimer', 'CloseTimer', 'ExitTimer', 'ShiftTimer')) {
+        $t = $Record.$name
+        if ($t) {
+            try { $t.Stop() } catch { }
+            Unregister-ToastTimer $t
+            $Record.$name = $null
+        }
+    }
+}
+
 function Dismiss-Toast {
     # Kill a toast's lifecycle timers (if any) and close the form immediately.
-    # Used by the hard-deadline sweep and by the "close" affordances so a stale
-    # auto-dismiss tick can never double-fire on a closing/disposed form.
-    param([System.Windows.Forms.Form]$Form)
-    if (-not $Form -or $Form.IsDisposed) { return }
-    try {
-        $ctx = $Form.Tag
-        if ($ctx) {
-            if ($ctx.CloseTimer) { try { $ctx.CloseTimer.Stop() } catch { }; Unregister-ToastTimer $ctx.CloseTimer; $ctx.CloseTimer = $null }
-            if ($ctx.FadeTimer)  { try { $ctx.FadeTimer.Stop() }  catch { }; Unregister-ToastTimer $ctx.FadeTimer;  $ctx.FadeTimer = $null }
-        }
-        try { $Form.Close() } catch { }
-    } catch { }
+    # Used by the hard-deadline sweep and by the stack-trim so a stale tick can
+    # never double-fire on a closing/disposed form. The Closed handler removes
+    # the record from the stack and re-lays-out the survivors.
+    param($Record)
+    if (-not $Record) { return }
+    try { if (-not $Record.Form -or $Record.Form.IsDisposed) { return } } catch { return }
+    Stop-ToastTimers -Record $Record
+    try { $Record.Form.Close() } catch { }
 }
 
 function Close-Toast {
-    # Close a toast form, optionally with a fade-out (symmetric with the
-    # fade-in). The fade runs on its own timer so the UI thread never blocks.
-    # v1.8.0: the fade timer is rooted BOTH in the script-scope registry and in
-    # the toast's context bag (form.Tag) - an unrooted local timer here was the
-    # root cause of toasts hanging on screen forever.
-    param(
-        [System.Windows.Forms.Form]$Form,
-        [bool]$Fade = $true
-    )
-    if (-not $Form) { return }
-    try { if ($Form.IsDisposed) { return } } catch { return }
-    if ($script:DebugLog) { $script:DebugLog.Add("CLOSE-TOAST entered fade=$Fade") | Out-Null }
+    # Close a toast with a fade-out + slight upward slide (symmetric with the
+    # enter animation). The exit runs on its own rooted timer so the UI thread
+    # never blocks and the timer can never be garbage-collected mid-run.
+    param($Record, [bool]$Fade = $true)
+    if (-not $Record) { return }
+    try { if (-not $Record.Form -or $Record.Form.IsDisposed) { return } } catch { return }
+    if ($Record.Closing) { return }
     if (-not $Fade) {
-        Dismiss-Toast -Form $Form
+        Dismiss-Toast -Record $Record
         return
     }
-    try {
-        $fadeTimer = New-Object System.Windows.Forms.Timer
-        $fadeTimer.Tag = $Form
-        $fadeTimer.Interval = 24
-        Register-ToastTimer $fadeTimer
-        try { $Form.Tag.FadeTimer = $fadeTimer } catch { }
-        if ($script:DebugLog) { $script:DebugLog.Add("CLOSE-TOAST fadeTimer created, adding tick") | Out-Null }
-        $fadeTimer.add_Tick({
-            $ft = $this
-            $ff = $ft.Tag
-            if ($script:DebugLog) { $script:DebugLog.Add("fade-tick entered; fadeTimerNull=$($null -eq $ft) formNull=$($null -eq $ff) opacity=$($ff.Opacity)") | Out-Null }
-            try {
-                $ff.Opacity = [Math]::Max(0, $ff.Opacity - 0.18)
-                if ($script:DebugLog) { $script:DebugLog.Add("fade-tick opacity now $($ff.Opacity)") | Out-Null }
-                if ($ff.Opacity -le 0) {
-                    $ft.Stop()
-                    Unregister-ToastTimer $ft
-                    if ($script:DebugLog) { $script:DebugLog.Add("fade-tick closing form") | Out-Null }
-                    try { $ff.Tag.FadeTimer = $null } catch { }
-                    try { $ff.Close() } catch { }
-                }
-            } catch {
-                if ($script:DebugLog) { $script:DebugLog.Add("fade-tick EXCEPTION: $($_.Exception.Message)") | Out-Null }
-                try { $ft.Stop() } catch { }
-                Unregister-ToastTimer $ft
-                try { $ff.Tag.FadeTimer = $null } catch { }
-                # A fade that cannot run (e.g. the form is already gone) must
-                # still end with the form closed - never leave a zombie toast.
-                try { $ff.Close() } catch { }
+    $Record.Closing = $true
+    Stop-ToastTimers -Record $Record
+    $Record.ExitStartOp = [double]$Record.Form.Opacity
+    $Record.ExitStep = 0
+    $exit = New-Object System.Windows.Forms.Timer
+    $exit.Interval = 16
+    $exit.Tag = $Record
+    Register-ToastTimer $exit
+    $Record.ExitTimer = $exit
+    $exit.add_Tick({
+        $tm = $this
+        $r = $tm.Tag
+        try {
+            $r.ExitStep++
+            $total = 10
+            $t = [Math]::Min(1.0, $r.ExitStep / $total)
+            $op = $r.ExitStartOp * (1.0 - $t * $t)
+            $loc = $r.Form.Location
+            $r.Form.Location = New-Object System.Drawing.Point($loc.X, ($loc.Y - 1))
+            $r.Form.Opacity = [Math]::Max(0, $op)
+            if ($r.ExitStep -ge $total) {
+                $tm.Stop()
+                Unregister-ToastTimer $tm
+                $r.ExitTimer = $null
+                try { $r.Form.Close() } catch { }
             }
-        })
-        $fadeTimer.Start()
-        if ($script:DebugLog) { $script:DebugLog.Add("CLOSE-TOAST fadeTimer started") | Out-Null }
-    }
-    catch {
-        if ($script:DebugLog) { $script:DebugLog.Add("CLOSE-TOAST CATCH: $($_.Exception.Message)") | Out-Null }
-        # Last resort: the fade itself could not be armed - close right away.
-        try { $Form.Close() } catch { }
-    }
+        }
+        catch {
+            try { $tm.Stop() } catch { }
+            Unregister-ToastTimer $tm
+            $r.ExitTimer = $null
+            try { $r.Form.Close() } catch { }
+        }
+    })
+    $exit.Start()
 }
 
-function Show-Toast {
-    # A custom Windows-11-style toast: borderless, rounded corners (DWM),
-    # accent bar on the left coloured by severity, whale icon, bold title,
-    # body text, close button; opens top-right with a fade, auto-dismisses.
-    # Debounce: if the visible toast was shown less than $ToastDebounceMs ago,
-    # it is *updated in place* (title/body/accent) instead of recreated - this
-    # kills the startup "blinking" flicker from rapid successive transitions.
+function New-KindIconImage {
+    # Draw the per-kind icon: a tinted circle (colour by severity) with a white
+    # MDL2 glyph inside. Used by the toast icon and the in-place update path.
+    param(
+        [int]$Glyph = 0xE946,
+        [System.Drawing.Color]$Tint = ([System.Drawing.Color]::FromArgb(38, 163, 255)),
+        [System.Drawing.Color]$GlyphFore = ([System.Drawing.Color]::White),
+        [int]$Size = 28
+    )
+    try {
+        $bmp = New-Object System.Drawing.Bitmap($Size, $Size)
+        $g = [System.Drawing.Graphics]::FromImage($bmp)
+        $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+        $g.Clear([System.Drawing.Color]::Transparent)
+        $brush = New-Object System.Drawing.SolidBrush($Tint)
+        $g.FillEllipse($brush, 1, 1, $Size - 2, $Size - 2)
+        $font = New-Object System.Drawing.Font("Segoe MDL2 Assets", [single]($Size * 0.5), [System.Drawing.FontStyle]::Regular)
+        $brush2 = New-Object System.Drawing.SolidBrush($GlyphFore)
+        $sf = New-Object System.Drawing.StringFormat
+        $sf.Alignment = [System.Drawing.StringAlignment]::Center
+        $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+        $rect = New-Object System.Drawing.RectangleF(0, 0, $Size, $Size)
+        $g.DrawString([char]$Glyph, $font, $brush2, $rect, $sf)
+        $sf.Dispose(); $brush2.Dispose(); $font.Dispose(); $brush.Dispose(); $g.Dispose()
+        return $bmp
+    }
+    catch { return $null }
+}
+
+function New-ToastForm {
+    # Build one toast form: borderless, rounded (DWM + fallback), accent bar,
+    # kind icon, bold title, HH:mm timestamp, wrapping body, close button and
+    # (when enabled) an action button. The form starts fully transparent; the
+    # enter animation raises opacity and slides it in from the right.
     param(
         [string]$Title,
         [string]$Text,
-        [System.Windows.Forms.ToolTipIcon]$Kind = [System.Windows.Forms.ToolTipIcon]::Info
+        [System.Windows.Forms.ToolTipIcon]$Kind,
+        $Meta,
+        [bool]$Dark
     )
-    if (-not $script:NotifyIcon) { return }
-
-    $dark = Resolve-MenuTheme
-    $accent = Get-AccentColor
-    # v1.8.0 dark palette: near-black surface, high-contrast title, soft dim
-    # body text and a subtle hover for the close button (VSCode/Fluent-like).
-    $bg        = if ($dark) { [System.Drawing.Color]::FromArgb(30, 30, 32) }     else { [System.Drawing.Color]::White }
-    $fg        = if ($dark) { [System.Drawing.Color]::FromArgb(240, 240, 242) }  else { [System.Drawing.Color]::FromArgb(30, 30, 30) }
-    $fgDim     = if ($dark) { [System.Drawing.Color]::FromArgb(158, 162, 168) }  else { [System.Drawing.Color]::FromArgb(110, 110, 110) }
-    $closeHov  = if ($dark) { [System.Drawing.Color]::FromArgb(58, 62, 68) }     else { [System.Drawing.Color]::FromArgb(238, 238, 238) }
-
-    switch ($Kind) {
-        ([System.Windows.Forms.ToolTipIcon]::Warning) { $bar = [System.Drawing.Color]::FromArgb(246, 191, 38) }
-        ([System.Windows.Forms.ToolTipIcon]::Error)   { $bar = [System.Drawing.Color]::FromArgb(232, 17, 35) }
-        default                                       { $bar = $accent }
-    }
-
-    # Rapid-succession debounce: update the already-visible toast in place.
-    if ($script:ToastForm) {
-        try {
-            $age = (Get-Date) - $script:ToastShownAt
-            if ($age.TotalMilliseconds -lt $script:ToastDebounceMs) {
-                $c = $script:ToastForm.Tag
-                $c.TitleLbl.Text = $Title
-                $c.BodyLbl.Text = $Text
-                $c.Bar.BackColor = $bar
-                # Restart the auto-dismiss countdown so the updated toast stays visible.
-                try { if ($c.CloseTimer) { $c.CloseTimer.Stop(); $c.CloseTimer.Start() } } catch { }
-                $script:ToastShownAt = Get-Date
-                return
-            }
-        } catch { }
-        # Outside the debounce window: stop the old toast's auto-dismiss timer
-        # first (a stale tick must not double-fire on a closing form), then fade
-        # the old toast out; a fresh toast is built below.
-        $oldCtx = $null
-        try { $oldCtx = $script:ToastForm.Tag } catch { }
-        if ($oldCtx -and $oldCtx.CloseTimer) {
-            try { $oldCtx.CloseTimer.Stop() } catch { }
-            Unregister-ToastTimer $oldCtx.CloseTimer
-            try { $oldCtx.CloseTimer = $null } catch { }
-        }
-        Close-Toast -Form $script:ToastForm -Fade $true
-    }
-
-    # Whale image for the toast (24 px).
-    $whaleImg = $null
-    try {
-        $wb = Get-WhaleBitmap
-        if ($wb) {
-            $whaleImg = New-Object System.Drawing.Bitmap(24, 24)
-            $wg = [System.Drawing.Graphics]::FromImage($whaleImg)
-            $wg.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-            $wg.DrawImage($wb, 0, 0, 24, 24)
-            $wg.Dispose(); $wb.Dispose()
-        }
-    } catch { }
+    $bg       = if ($Dark) { [System.Drawing.Color]::FromArgb(30, 30, 32) }    else { [System.Drawing.Color]::White }
+    $fg       = if ($Dark) { [System.Drawing.Color]::FromArgb(240, 240, 242) } else { [System.Drawing.Color]::FromArgb(30, 30, 30) }
+    $fgDim    = if ($Dark) { [System.Drawing.Color]::FromArgb(158, 162, 168) }  else { [System.Drawing.Color]::FromArgb(110, 110, 110) }
+    $closeHov = if ($Dark) { [System.Drawing.Color]::FromArgb(58, 62, 68) }     else { [System.Drawing.Color]::FromArgb(238, 238, 238) }
+    $actionBg = if ($Dark) { [System.Drawing.Color]::FromArgb(42, 46, 52) }     else { [System.Drawing.Color]::FromArgb(229, 243, 255) }
+    $actionHov = if ($Dark) { [System.Drawing.Color]::FromArgb(52, 58, 66) }    else { [System.Drawing.Color]::FromArgb(200, 230, 255) }
+    $actionFg = if ($Dark) { [System.Drawing.Color]::FromArgb(120, 190, 255) }  else { [System.Drawing.Color]::FromArgb(0, 95, 175) }
 
     $form = New-Object System.Windows.Forms.Form
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
-    $form.StartPosition    = [System.Windows.Forms.FormStartPosition]::Manual
-    $form.ShowInTaskbar    = $false
-    $form.TopMost          = $true
-    $form.BackColor        = $bg
-    $form.Padding          = New-Object System.Windows.Forms.Padding(0)
-    $form.Height           = 84
-    $form.Width            = 350
+    $form.StartPosition = [System.Windows.Forms.FormStartPosition]::Manual
+    $form.ShowInTaskbar = $false
+    $form.TopMost = $true
+    $form.BackColor = $bg
+    $form.Padding = New-Object System.Windows.Forms.Padding(0)
+    $form.Width = $script:ToastWidth
+    $form.Height = $script:ToastHeight
+    $form.Opacity = 0
 
-    # Context bag carried on the form's and each control's .Tag so event
-    # handlers can reach the form/colors/image via $this.Tag — PowerShell
-    # delegates do NOT reliably capture local variables once the defining
-    # function returns, so referencing $form here would break (e.g. the
-    # asynchronous Shown/Tick/Click handlers crash on 'property not found').
-    $ctx = @{ Form = $form; CloseHov = $closeHov; Whale = $whaleImg; CloseTimer = $null; FadeTimer = $null }
+    # Context bag (form.Tag). PowerShell delegates do NOT reliably capture local
+    # variables once the defining function returns, so async handlers reach the
+    # form/colors/record/image via $this.Tag.
+    $ctx = @{
+        Form = $form; CloseHov = $closeHov; Record = $null
+        TitleLbl = $null; BodyLbl = $null; Bar = $null
+        KindPic = $null; KindImage = $null; Action = $Meta.Action
+        ActionBg = $actionBg; ActionHov = $actionHov
+    }
     $form.Tag = $ctx
 
     # Accent bar (left).
     $barPanel = New-Object System.Windows.Forms.Panel
-    $barPanel.Width = 5
+    $barPanel.Width = 4
     $barPanel.Dock = [System.Windows.Forms.DockStyle]::Left
-    $barPanel.BackColor = $bar
+    $barPanel.BackColor = $Meta.Bar
     $form.Controls.Add($barPanel)
 
     # Close button.
@@ -753,121 +932,362 @@ function Show-Toast {
     $close.Size = New-Object System.Drawing.Size(24, 24)
     $close.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
     $close.Cursor = [System.Windows.Forms.Cursors]::Hand
-    $close.Location = New-Object System.Drawing.Point(322, 4)
+    $close.Location = New-Object System.Drawing.Point(330, 8)
     $close.Tag = $ctx
     $close.add_MouseEnter({ $this.BackColor = $this.Tag.CloseHov })
     $close.add_MouseLeave({ $this.BackColor = [System.Drawing.Color]::Transparent })
-    $close.add_Click({ try { $this.Tag.Form.Close() } catch { } })
+    $close.add_Click({ try { if ($this.Tag.Record) { Close-Toast -Record $this.Tag.Record -Fade $true } } catch { } })
 
-    # Icon (whale) top-left.
+    # Kind icon (tinted circle + MDL2 glyph).
+    $kindImg = New-KindIconImage -Glyph $Meta.Glyph -Tint $Meta.Tint -GlyphFore $Meta.GlyphFore
     $iconPic = New-Object System.Windows.Forms.PictureBox
-    $iconPic.Size = New-Object System.Drawing.Size(24, 24)
+    $iconPic.Size = New-Object System.Drawing.Size(28, 28)
     $iconPic.Location = New-Object System.Drawing.Point(14, 12)
     $iconPic.SizeMode = [System.Windows.Forms.PictureBoxSizeMode]::Zoom
-    if ($whaleImg) { $iconPic.Image = $whaleImg }
+    if ($kindImg) { $iconPic.Image = $kindImg }
+    $ctx.KindPic = $iconPic
+    $ctx.KindImage = $kindImg
 
-    # Title (bold) under/next to icon.
+    # Title (bold).
     $titleLbl = New-Object System.Windows.Forms.Label
     $titleLbl.Text = $Title
     $titleLbl.ForeColor = $fg
     $titleLbl.Font = (Resolve-UiFont -Size 10 -Style ([System.Drawing.FontStyle]::Bold))
-    $titleLbl.Location = New-Object System.Drawing.Point(46, 10)
-    $titleLbl.Size = New-Object System.Drawing.Size(268, 22)
+    $titleLbl.Location = New-Object System.Drawing.Point(50, 12)
+    $titleLbl.Size = New-Object System.Drawing.Size(238, 22)
     $titleLbl.AutoEllipsis = $true
 
-    # Body text wraps.
+    # Timestamp (HH:mm) bottom-right.
+    $timeLbl = New-Object System.Windows.Forms.Label
+    $timeLbl.Text = (Get-Date).ToString("HH:mm")
+    $timeLbl.ForeColor = $fgDim
+    $timeLbl.Font = (Resolve-UiFont -Size 8 -Style ([System.Drawing.FontStyle]::Regular))
+    $timeLbl.TextAlign = [System.Drawing.ContentAlignment]::MiddleRight
+    $timeLbl.Location = New-Object System.Drawing.Point(250, 66)
+    $timeLbl.Size = New-Object System.Drawing.Size(88, 18)
+
+    # Body text wraps (2 lines max, ellipsis).
     $bodyLbl = New-Object System.Windows.Forms.Label
     $bodyLbl.Text = $Text
     $bodyLbl.ForeColor = $fgDim
     $bodyLbl.Font = (Resolve-UiFont -Size 9 -Style ([System.Drawing.FontStyle]::Regular))
-    $bodyLbl.Location = New-Object System.Drawing.Point(46, 32)
-    $bodyLbl.Size = New-Object System.Drawing.Size(286, 44)
+    $bodyLbl.Location = New-Object System.Drawing.Point(50, 36)
+    $bodyLbl.Size = New-Object System.Drawing.Size(292, 40)
+    $bodyLbl.AutoEllipsis = $true
+
+    $ctx.TitleLbl = $titleLbl
+    $ctx.BodyLbl = $bodyLbl
+    $ctx.Bar = $barPanel
 
     # Click on content opens the dashboard.
     foreach ($c in @($iconPic, $titleLbl, $bodyLbl)) {
         $c.Cursor = [System.Windows.Forms.Cursors]::Hand
         $c.Tag = $ctx
-        $c.add_Click({ try { Start-DshApp } catch { } ; try { $this.Tag.Form.Close() } catch { } })
+        $c.add_Click({ try { Start-DshApp } catch { }; try { if ($this.Tag.Record) { Close-Toast -Record $this.Tag.Record -Fade $true } } catch { } })
     }
 
-    # Expose the labels/bar for the in-place update path.
-    $ctx.TitleLbl = $titleLbl
-    $ctx.BodyLbl = $bodyLbl
-    $ctx.Bar = $barPanel
+    # Action button (Open / Restart / Update) in the bottom row.
+    if ($script:ToastActionsEnabled -and $Meta.Action -ne "none") {
+        $btn = New-Object System.Windows.Forms.Label
+        $btn.Text = Get-ToastActionLabel -Action $Meta.Action
+        $btn.ForeColor = $actionFg
+        $btn.BackColor = $actionBg
+        $btn.Font = (Resolve-UiFont -Size 8.5 -Style ([System.Drawing.FontStyle]::Bold))
+        $btn.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+        $btn.Cursor = [System.Windows.Forms.Cursors]::Hand
+        $btn.Size = New-Object System.Drawing.Size(120, 24)
+        $btn.Location = New-Object System.Drawing.Point(50, 66)
+        $btn.Tag = $ctx
+        $btn.add_MouseEnter({ $this.BackColor = $this.Tag.ActionHov })
+        $btn.add_MouseLeave({ $this.BackColor = $this.Tag.ActionBg })
+        $btn.add_Click({
+            $c = $this.Tag
+            if ($c) {
+                switch ($c.Action) {
+                    "restart" { try { Restart-DshProxy } catch { } }
+                    "update"  { try { Invoke-DshUpdate } catch { } }
+                    default   { try { Start-DshApp } catch { } }
+                }
+                try { if ($c.Record) { Close-Toast -Record $c.Record -Fade $true } } catch { }
+            }
+        })
+        $form.Controls.Add($btn)
+    }
 
+    $form.Controls.Add($timeLbl)
     $form.Controls.Add($bodyLbl)
     $form.Controls.Add($titleLbl)
     $form.Controls.Add($iconPic)
     $form.Controls.Add($close)
     $form.Controls.Add($barPanel)
 
-    # Position top-right above the system tray.
-    $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-    $pad = 12
-    $toastX = $wa.Right - $form.Width - $pad
-    $toastY = $wa.Top + $pad
-    $form.Location = New-Object System.Drawing.Point($toastX, $toastY)
-
-    $script:ToastForm = $form
-
     $form.add_Shown({
-        # $this is the toast form (event sender). Rounded corners on Win11;
-        # try Mica on 22H2+, ignore failures on Win10.
         $f = $this
         try { [DshDwm]::ApplyRoundCorners($f.Handle) } catch { }
-        try { [DshDwm]::TryMica($f.Handle) } catch { }
-        try { $f.Opacity = 0 } catch { }
-        $animTimer = New-Object System.Windows.Forms.Timer
-        $animTimer.Tag = $f
-        $animTimer.Interval = 32
-        Register-ToastTimer $animTimer
-        $animTimer.add_Tick({
-            # $this is the animation timer; the form rides on .Tag.
-            $timer = $this
-            $ff = $timer.Tag
-            try {
-                $ff.Opacity = [Math]::Min(1.0, $ff.Opacity + 0.14)
-                if ($ff.Opacity -ge 1.0) {
-                    $timer.Stop()
-                    Unregister-ToastTimer $timer
-                    $closeTimer = New-Object System.Windows.Forms.Timer
-                    $closeTimer.Tag = $ff
-                    $closeTimer.Interval = $script:ToastDurationMs
-                    Register-ToastTimer $closeTimer
-                    $closeTimer.add_Tick({
-                        if ($script:DebugLog) { $script:DebugLog.Add("closetimer TICK") | Out-Null }
-                        try {
-                            $this.Stop()
-                            Unregister-ToastTimer $this
-                            $tf = $this.Tag
-                            Close-Toast -Form $tf -Fade $true
-                        } catch { }
-                    })
-                    # Publish the auto-dismiss timer so the in-place update path
-                    # can restart it when the toast content is refreshed.
-                    try { $ff.Tag.CloseTimer = $closeTimer } catch { }
-                    $closeTimer.Start()
-                }
-            } catch {
-                try { $timer.Stop() } catch { }
-                Unregister-ToastTimer $timer
-            }
-        })
-        $animTimer.Start()
-    })
-    $form.add_Closed({
-        if ($script:ToastForm -eq $this) { $script:ToastForm = $null }
-        # Release any still-registered lifecycle timers of this toast.
-        try {
-            $ct = $this.Tag
-            if ($ct.CloseTimer) { Unregister-ToastTimer $ct.CloseTimer }
-            if ($ct.FadeTimer)  { Unregister-ToastTimer $ct.FadeTimer }
-            if ($ct.Whale)      { $ct.Whale.Dispose() }
-        } catch { }
+        if ($script:ToastTranslucent) {
+            try { [DshDwm]::TryMica($f.Handle) } catch { }
+        }
     })
 
-    $script:ToastShownAt = Get-Date
+    $form.add_Closed({
+        $f = $this
+        try {
+            $ctx = $f.Tag
+            if ($ctx) {
+                if ($ctx.Record) {
+                    Stop-ToastTimers -Record $ctx.Record
+                    Remove-ToastRecordFromStack -Record $ctx.Record
+                }
+                if ($ctx.KindImage) { try { $ctx.KindImage.Dispose() } catch { } }
+            }
+        } catch { }
+        Layout-Toasts -Animate $true
+    })
+
+    return $form
+}
+
+function Remove-ToastRecordFromStack {
+    # Remove a toast record from the stack (its Closed handler calls this).
+    # Idempotent: a form only closes once, so a record is removed at most once.
+    param($Record)
+    if (-not $Record) { return }
+    try {
+        $idx = $script:Toasts.IndexOf($Record)
+        if ($idx -ge 0) { [void]$script:Toasts.RemoveAt($idx) }
+    } catch { }
+}
+
+function Start-ToastAutoClose {
+    # Arm the auto-dismiss timer for a toast (rooted; fired after ToastDurationMs).
+    param($Record)
+    if ($Record.Closing) { return }
+    $t = New-Object System.Windows.Forms.Timer
+    $t.Interval = $script:ToastDurationMs
+    $t.Tag = $Record
+    Register-ToastTimer $t
+    $Record.CloseTimer = $t
+    $t.add_Tick({
+        try {
+            $this.Stop()
+            Unregister-ToastTimer $this
+            $r = $this.Tag
+            $r.CloseTimer = $null
+            Close-Toast -Record $r -Fade $true
+        } catch { }
+    })
+    $t.Start()
+}
+
+function Start-ToastEnter {
+    # Enter animation: slide in from the right edge + ease-out fade. All
+    # animation data lives on the record (read via $this.Tag), so the tick
+    # closure never depends on captured locals.
+    param($Record)
+    try {
+        $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
+        $pts = @(New-ToastSlotLayout -Count $script:Toasts.Count -WorkingArea $wa -Width $script:ToastWidth -Height $script:ToastHeight -Gap $script:ToastGap -Pad $script:ToastPad)
+        $Target = $pts[0]
+        $Record.EnterStartX = [double]($wa.Right + 20)
+        $Record.EnterTargetX = [double]$Target.X
+        $Record.EnterTargetY = [double]$Target.Y
+        $Record.Step = 0
+        $Record.Entering = $true
+        $Record.Form.Location = New-Object System.Drawing.Point([int]$Record.EnterStartX, [int]$Record.EnterTargetY)
+        $Record.Form.Opacity = 0
+        $anim = New-Object System.Windows.Forms.Timer
+        $anim.Interval = 16
+        $anim.Tag = $Record
+        Register-ToastTimer $anim
+        $Record.AnimTimer = $anim
+        $anim.add_Tick({
+            $tm = $this
+            $r = $tm.Tag
+            try {
+                $r.Step++
+                $total = 18
+                $t = [Math]::Min(1.0, $r.Step / $total)
+                $e = 1.0 - [Math]::Pow(1.0 - $t, 3)
+                $x = $r.EnterStartX + ($r.EnterTargetX - $r.EnterStartX) * $e
+                $op = $r.RestOpacity * [Math]::Min(1.0, $t * 1.4)
+                $r.Form.Location = New-Object System.Drawing.Point([int]$x, [int]$r.EnterTargetY)
+                $r.Form.Opacity = $op
+                if ($r.Step -ge $total) {
+                    $tm.Stop()
+                    Unregister-ToastTimer $tm
+                    $r.AnimTimer = $null
+                    $r.Entering = $false
+                    $r.Form.Location = New-Object System.Drawing.Point([int]$r.EnterTargetX, [int]$r.EnterTargetY)
+                    $r.Form.Opacity = $r.RestOpacity
+                    Start-ToastAutoClose -Record $r
+                }
+            }
+            catch {
+                try { $tm.Stop() } catch { }
+                Unregister-ToastTimer $tm
+                $r.AnimTimer = $null
+                $r.Entering = $false
+                try { $r.Form.Opacity = $r.RestOpacity } catch { }
+                Start-ToastAutoClose -Record $r
+            }
+        })
+        $anim.Start()
+    }
+    catch { }
+}
+
+function Start-ToastShift {
+    # Animate an existing toast to a new slot (e.g. when a newer toast arrives
+    # above it). Ease-out; aborts cleanly if the form is already there.
+    param($Record, $Target)
+    if (-not $Record -or -not $Record.Form) { return }
+    try { if ($Record.Form.IsDisposed) { return } } catch { return }
+    try { if ($Record.Form.Location -eq $Target) { return } } catch { return }
+    if ($Record.ShiftTimer) {
+        try { $Record.ShiftTimer.Stop() } catch { }
+        Unregister-ToastTimer $Record.ShiftTimer
+        $Record.ShiftTimer = $null
+    }
+    $Record.ShiftStart = $Record.Form.Location
+    $Record.ShiftTarget = $Target
+    $Record.ShiftStep = 0
+    $st = New-Object System.Windows.Forms.Timer
+    $st.Interval = 16
+    $st.Tag = $Record
+    Register-ToastTimer $st
+    $Record.ShiftTimer = $st
+    $st.add_Tick({
+        $tm = $this
+        $r = $tm.Tag
+        try {
+            $r.ShiftStep++
+            $total = 12
+            $t = [Math]::Min(1.0, $r.ShiftStep / $total)
+            $e = 1.0 - [Math]::Pow(1.0 - $t, 3)
+            $sx = [double]$r.ShiftStart.X
+            $sy = [double]$r.ShiftStart.Y
+            $tx = [double]$r.ShiftTarget.X
+            $ty = [double]$r.ShiftTarget.Y
+            $x = $sx + ($tx - $sx) * $e
+            $y = $sy + ($ty - $sy) * $e
+            $r.Form.Location = New-Object System.Drawing.Point([int]$x, [int]$y)
+            if ($r.ShiftStep -ge $total) {
+                $tm.Stop()
+                Unregister-ToastTimer $tm
+                $r.ShiftTimer = $null
+                $r.Form.Location = $r.ShiftTarget
+            }
+        }
+        catch {
+            try { $tm.Stop() } catch { }
+            Unregister-ToastTimer $tm
+            $r.ShiftTimer = $null
+            try { $r.Form.Location = $r.ShiftTarget } catch { }
+        }
+    })
+    $st.Start()
+}
+
+function Layout-Toasts {
+    # Lay out the whole stack vertically in the top-right corner. Newest (index
+    # 0) is at the top; each toast gets its own slot so nothing overlaps. With
+    # -Animate, survivors smoothly shift to their new slots.
+    param([bool]$Animate = $true)
+    if ($script:Toasts.Count -eq 0) { return }
+    try { $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea } catch { return }
+    $points = @(New-ToastSlotLayout -Count $script:Toasts.Count -WorkingArea $wa -Width $script:ToastWidth -Height $script:ToastHeight -Gap $script:ToastGap -Pad $script:ToastPad)
+    for ($i = 0; $i -lt $script:Toasts.Count; $i++) {
+        $rec = $script:Toasts[$i]
+        if (-not $rec -or -not $rec.Form) { continue }
+        try { if ($rec.Form.IsDisposed) { continue } } catch { continue }
+        # The newest toast (index 0) is entering: its own enter animation targets
+        # slot 0, so it must not be touched here. An OLDER toast that is still
+        # entering, though, must give up slot 0 - snap its fade to the resting
+        # opacity and let the shift animation carry it to its new slot, otherwise
+        # it would land on top of the newer toast (overlap bug).
+        if ($rec.Entering) {
+            if ($i -eq 0) { continue }
+            Stop-ToastTimers -Record $rec
+            $rec.Entering = $false
+            try { $rec.Form.Opacity = $rec.RestOpacity } catch { }
+            Start-ToastAutoClose -Record $rec
+        }
+        if ($Animate) { Start-ToastShift -Record $rec -Target $points[$i] }
+        else { try { $rec.Form.Location = $points[$i] } catch { } }
+    }
+}
+
+function Update-ToastInPlace {
+    # Debounce path: refresh the top toast's content/colour and restart its
+    # auto-dismiss countdown instead of creating a duplicate toast.
+    param($Record, [string]$Title, [string]$Text, $Kind, $Meta)
+    try {
+        $c = $Record.Ctx
+        if ($c) {
+            $c.TitleLbl.Text = $Title
+            $c.BodyLbl.Text = $Text
+            $c.Bar.BackColor = $Meta.Bar
+            if ($Kind -ne $Record.Kind) {
+                $img = New-KindIconImage -Glyph $Meta.Glyph -Tint $Meta.Tint -GlyphFore $Meta.GlyphFore
+                $c.KindPic.Image = $img
+                if ($c.KindImage) { try { $c.KindImage.Dispose() } catch { } }
+                $c.KindImage = $img
+            }
+        }
+        if ($Record.CloseTimer) { try { $Record.CloseTimer.Stop(); $Record.CloseTimer.Start() } catch { } }
+    } catch { }
+    $Record.Title = $Title
+    $Record.Text = $Text
+    $Record.Kind = $Kind
+    $Record.ShownAt = Get-Date
+}
+
+function Show-Toast {
+    # v1.9.0: stacked notification toast. Every event becomes a new toast on the
+    # stack (up to ToastMax, oldest force-closed at the cap); toasts occupy
+    # separate slots top-right, so they never overlap. A young same-kind top
+    # toast is updated in place (debounce, kills the startup flicker). Each
+    # toast auto-dismisses on its own rooted timer with a fade-out.
+    param(
+        [string]$Title,
+        [string]$Text,
+        [System.Windows.Forms.ToolTipIcon]$Kind = [System.Windows.Forms.ToolTipIcon]::Info,
+        [string]$Action = "auto"
+    )
+    if (-not $script:NotifyIcon) { return }
+
+    $dark = Resolve-MenuTheme
+    $meta = Resolve-ToastKindMeta -Kind $Kind -Action $Action
+
+    if (Test-ToastShouldUpdateInPlace -Kind $Kind -Now (Get-Date)) {
+        Update-ToastInPlace -Record $script:Toasts[0] -Title $Title -Text $Text -Kind $Kind -Meta $meta
+        return
+    }
+
+    $form = New-ToastForm -Title $Title -Text $Text -Kind $Kind -Meta $meta -Dark $dark
+    $rec = @{
+        Form = $form; Ctx = $form.Tag; Kind = $Kind; Title = $Title; Text = $Text
+        ShownAt = Get-Date
+        CloseTimer = $null; AnimTimer = $null; ExitTimer = $null; ShiftTimer = $null
+        Closing = $false; Entering = $true; RestOpacity = 1.0
+        EnterStartX = 0.0; EnterTargetX = 0.0; EnterTargetY = 0.0; Step = 0
+        ShiftStart = $null; ShiftTarget = $null; ShiftStep = 0
+        ExitStartOp = 1.0; ExitStep = 0
+    }
+    $rec.RestOpacity = if ($script:ToastTranslucent) { 0.92 } else { 1.0 }
+    $form.Tag.Record = $rec
+    $rec.Ctx.Record = $rec
+
+    $script:Toasts.Insert(0, $rec)
+
+    # Trim overflow: toasts beyond ToastMax are force-closed now (their Closed
+    # handlers remove them from the stack).
+    $drop = @(Select-ToastStackTrim -Stack $script:Toasts -Max $script:ToastMax)
+    foreach ($d in $drop) { Dismiss-Toast -Record $d }
+
     try { $form.Show() } catch { }
+    Layout-Toasts -Animate $true
+    Start-ToastEnter -Record $rec
 }
 
 
@@ -1310,6 +1730,16 @@ function Read-Config {
         # How long a toast stays visible before auto-dismissing (ms). The
         # hard-deadline sweep closes it at duration + 2500ms no matter what.
         toastduration        = 4000
+        # --- v1.9.0: stacked toasts + notification history ---
+        # Max number of toasts shown at once (stacked top-right, oldest
+        # force-closed at the cap). 1-8.
+        toastmax             = 4
+        # Show the action button (Open / Restart / Update) on toasts.
+        toastactions         = $true
+        # Max entries kept in the "Notifications" history menu (0 disables it).
+        toasthistory         = 20
+        # Subtle transparency for toasts on Win11 (falls back to opaque).
+        toasttranslucent     = $true
         # --- v1.6.0: unified smooth fonts + dsh update checks ---
         uifont               = "Segoe UI Variable Text"  # menu + toast font (falls back to Segoe UI)
         uifontsize           = 9        # base body font size (pt) for menu + toasts
@@ -1356,6 +1786,8 @@ function Read-Config {
     $cfg['uifontsize']            = [int](Assert-ConfigNumeric -Key 'uifontsize' -Value $cfg['uifontsize'] -Default 9 -Min 6 -Max 72)
     $cfg['maxconsecutiverestarts'] = [int](Assert-ConfigNumeric -Key 'maxconsecutiverestarts' -Value $cfg['maxconsecutiverestarts'] -Default 10 -Min 1 -Max 1000)
     $cfg['toastduration']         = [int](Assert-ConfigNumeric -Key 'toastduration' -Value $cfg['toastduration'] -Default 4000 -Min 1000 -Max 60000)
+    $cfg['toastmax']              = [int](Assert-ConfigNumeric -Key 'toastmax' -Value $cfg['toastmax'] -Default 4 -Min 1 -Max 8)
+    $cfg['toasthistory']          = [int](Assert-ConfigNumeric -Key 'toasthistory' -Value $cfg['toasthistory'] -Default 20 -Min 0 -Max 200)
 
     # URL fields are derived from the port unless explicitly set.
     $cfg['healthurl']    = "http://127.0.0.1:$($cfg['port'])/"
@@ -1391,6 +1823,12 @@ function Init-I18n {
             StatusNeedsIntervention = "需要人工干预"
             MenuDashboard       = "打开面板"
             MenuNewChat         = "开启新对话"
+            MenuNotifications   = "通知"
+            MenuNotificationsNone = "(暂无通知)"
+            MenuNotificationsClear = "清空通知记录"
+            BalloonActionOpen   = "打开面板"
+            BalloonActionRestart = "重启 dsh"
+            BalloonActionUpdate = "更新"
             MenuRestart         = "重启 dsh"
             MenuStop            = "停止 dsh"
             MenuExit            = "退出"
@@ -1450,6 +1888,12 @@ function Init-I18n {
             StatusNeedsIntervention = "Needs intervention"
             MenuDashboard       = "Open Dashboard"
             MenuNewChat         = "New Conversation"
+            MenuNotifications   = "Notifications"
+            MenuNotificationsNone = "(no notifications yet)"
+            MenuNotificationsClear = "Clear notifications"
+            BalloonActionOpen   = "Open Dashboard"
+            BalloonActionRestart = "Restart dsh"
+            BalloonActionUpdate = "Update"
             MenuRestart         = "Restart dsh"
             MenuStop            = "Stop dsh"
             MenuExit            = "Exit"
@@ -1509,6 +1953,12 @@ function Init-I18n {
             StatusNeedsIntervention = "Требуется вмешательство"
             MenuDashboard       = "Открыть панель"
             MenuNewChat         = "Новый диалог"
+            MenuNotifications   = "Уведомления"
+            MenuNotificationsNone = "(пока нет уведомлений)"
+            MenuNotificationsClear = "Очистить историю уведомлений"
+            BalloonActionOpen   = "Открыть панель"
+            BalloonActionRestart = "Перезапустить dsh"
+            BalloonActionUpdate = "Обновить"
             MenuRestart         = "Перезапустить dsh"
             MenuStop            = "Остановить dsh"
             MenuExit            = "Выход"
@@ -3183,6 +3633,12 @@ $script:HealthIntervalSeconds = [int]$script:Config.healthintervalseconds
 $script:StartupGraceSeconds = [int]$script:Config.startupgraceseconds
 $script:RestartDelaySeconds = [int]$script:Config.restartdelayseconds
 $script:ToastDurationMs = [int]$script:Config.toastduration
+# v1.9.0: the toast stack + notification history. ToastMax caps concurrent
+# toasts; ToastHistoryCap caps history entries (0 disables the history menu).
+$script:ToastMax = [int]$script:Config.toastmax
+$script:ToastActionsEnabled = try { [bool]$script:Config.toastactions } catch { $true }
+$script:ToastHistoryCap = [int]$script:Config.toasthistory
+$script:ToastTranslucent = try { [bool]$script:Config.toasttranslucent } catch { $true }
 Init-I18n
 
 # Compile the P/Invoke + fluent color table types used by the modern UI/toasts.
@@ -3210,7 +3666,7 @@ if (-not $createdNew) {
 try {
     Write-TrayLog "Tray application starting (Windows-native dsh) port=$($script:Port) v$($script:Version) lang=$($script:Lang)"
     Write-TrayLog "boot manifest: pid=$PID ps=$($PSVersionTable.PSVersion) os=$([Environment]::OSVersion.VersionString) tray=$($script:TrayRoot) startscript=$($script:StartScript) dshlog=$($script:DshLogFile) healthurl=$($script:HealthUrl) mutex=$mutexName"
-    Write-TrayLog "config: port=$($script:Port) healthinterval=$($script:HealthIntervalSeconds)s grace=$($script:StartupGraceSeconds)s restartdelay=$($script:RestartDelaySeconds)s maxrestarts=$($script:Config.maxconsecutiverestarts) healthconfirmations=$($script:Config.healthconfirmations) healthdebounce=$($script:Config.healthdebounceseconds)s lang=$($script:Lang) notifications=$($script:Config.notifications) whaleicon=$($script:Config.whaleicon) agentmonitor=$($script:Config.agentmonitor) agentpoll=$($script:Config.agentpollseconds)s badgeicon=$($script:Config.badgeicon) updatecheck=$($script:Config.updatecheck) updateintervalh=$($script:Config.updateintervalhours) toastson=$($script:Config.toastson) toastduration=$($script:ToastDurationMs) theme=$($script:Config.menutheme) menubicons=$($script:Config.menubicons)"
+    Write-TrayLog "config: port=$($script:Port) healthinterval=$($script:HealthIntervalSeconds)s grace=$($script:StartupGraceSeconds)s restartdelay=$($script:RestartDelaySeconds)s maxrestarts=$($script:Config.maxconsecutiverestarts) healthconfirmations=$($script:Config.healthconfirmations) healthdebounce=$($script:Config.healthdebounceseconds)s lang=$($script:Lang) notifications=$($script:Config.notifications) whaleicon=$($script:Config.whaleicon) agentmonitor=$($script:Config.agentmonitor) agentpoll=$($script:Config.agentpollseconds)s badgeicon=$($script:Config.badgeicon) updatecheck=$($script:Config.updatecheck) updateintervalh=$($script:Config.updateintervalhours) toastson=$($script:Config.toastson) toastduration=$($script:ToastDurationMs) toastmax=$($script:ToastMax) toastactions=$($script:ToastActionsEnabled) toasthistory=$($script:ToastHistoryCap) toasttranslucent=$($script:ToastTranslucent) theme=$($script:Config.menutheme) menubicons=$($script:Config.menubicons)"
 
     $script:Context = New-Object System.Windows.Forms.ApplicationContext
     $script:NotifyIcon = New-Object System.Windows.Forms.NotifyIcon
@@ -3304,6 +3760,17 @@ try {
     # v1.7.1: the async new-conversation job toggles this item disabled/"..."
     # while it is in flight.
     $script:NewChatMenuItem = $newChatItem
+
+    # v1.9.0: "Notifications" submenu with the history of recent toasts/balloons.
+    # Contents are rebuilt live by Rebuild-NotificationMenu as events arrive.
+    $notifMenu = New-Object System.Windows.Forms.ToolStripMenuItem
+    $notifMenu.Text = $script:L.MenuNotifications
+    $notifMenu.DropDown = New-Object System.Windows.Forms.ContextMenuStrip
+    Set-ItemIcon -Item $notifMenu -Code 0xEA8F
+    [void]$menu.Items.Add($notifMenu)
+    $script:NotificationMenuItem = $notifMenu
+    $script:NotificationMenu = $notifMenu.DropDown
+    Rebuild-NotificationMenu
 
     [void]$menu.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
@@ -3468,23 +3935,31 @@ try {
     })
     $script:Timer.Start()
 
-    # Toast safety sweep (v1.8.0): a script-scope rooted timer that force-closes
-    # any toast past its hard deadline (duration + sweep grace). Even if a toast's
-    # own fade/auto-dismiss timers are ever starved, no toast can stay on screen
-    # forever - this is the guaranteed-tight upper bound on toast lifetime.
+    # Toast safety sweep (v1.8.0 + v1.9.0 stack): a script-scope rooted timer
+    # that force-closes any toast past its hard deadline (duration + sweep
+    # grace) and enforces the stack cap. Even if a toast's own fade/auto-dismiss
+    # timers are ever starved, no toast can stay on screen forever - this is the
+    # guaranteed-tight upper bound on toast lifetime.
     $script:ToastSweepTimer = New-Object System.Windows.Forms.Timer
     $script:ToastSweepTimer.Interval = $script:ToastSweepIntervalMs
     $script:ToastSweepTimer.add_Tick({
         try {
-            $t = $script:ToastForm
-            if (-not $t) { return }
-            if (Test-ToastDeadlineExceeded -ShownAt $script:ToastShownAt -Now (Get-Date) -DurationMs $script:ToastDurationMs -GraceMs $script:ToastSweepGraceMs) {
+            foreach ($r in @($script:Toasts)) {
                 try {
-                    if (-not $t.IsDisposed -and $t.Visible) {
-                        Write-TrayLog "toast sweep: force-closing a toast past its lifetime (duration=$($script:ToastDurationMs)ms)"
-                        Dismiss-Toast -Form $t
+                    if (-not $r -or $r.Closing) { continue }
+                    if (Test-ToastDeadlineExceeded -ShownAt $r.ShownAt -Now (Get-Date) -DurationMs $script:ToastDurationMs -GraceMs $script:ToastSweepGraceMs) {
+                        if (-not $r.Form.IsDisposed -and $r.Form.Visible) {
+                            Write-TrayLog "toast sweep: force-closing a toast past its lifetime (duration=$($script:ToastDurationMs)ms)"
+                            Dismiss-Toast -Record $r
+                        }
                     }
                 } catch { }
+            }
+            # Defensive cap: never exceed ToastMax toasts, however stuck.
+            while ($script:Toasts.Count -gt $script:ToastMax) {
+                $old = $script:Toasts[$script:Toasts.Count - 1]
+                if ($old) { Dismiss-Toast -Record $old }
+                else { try { [void]$script:Toasts.RemoveAt($script:Toasts.Count - 1) } catch { break } }
             }
         } catch { }
     })

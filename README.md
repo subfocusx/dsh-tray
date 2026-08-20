@@ -68,6 +68,10 @@ wscript //nologo dsh-tray-launch.vbs
 | `menutheme` | `dark` | **v1.5.0 / v1.8.0** 菜单与 toast 主题：`auto`（跟随系统明/暗）/ `light` / `dark`。**v1.8.0 起默认 `dark`**，且可在托盘菜单「主题 / Theme / 主题」子菜单中即时切换（写回 dsh-tray.json，无需重启） |
 | `toastson` | `true` | **v1.5.0** `true` → 现代 Windows 11 通知（自绘圆角 toast + 强调色条 + 鲸鱼图标）；`false` → 经典系统气泡（回退） |
 | `toastduration` | `4000` | **v1.8.0** toast 自动关闭前停留时间（毫秒，范围 1000–60000）。**v1.8.0 修复了 toast「永远不消失」**：所有 toast 计时器现在有根引用，另有 250ms 巡检在 duration+2500ms 硬上限强制关闭，任何情况下 toast 都不会无限悬挂 |
+| `toastmax` | `4` | **v1.9.0** 同时在屏幕上的 toast 数量上限（1–8）。toast 从右上角垂直堆叠、互不重叠，超出上限时最旧的被强制关闭 |
+| `toastactions` | `true` | **v1.9.0** 在 toast 上显示动作按钮（打开面板 / 重启 dsh / 更新） |
+| `toasthistory` | `20` | **v1.9.0** 菜单「通知 / Notifications / Уведомления」中保留的通知历史条数（0 = 关闭历史菜单） |
+| `toasttranslucent` | `true` | **v1.9.0** Win11 下 toast 的轻微半透明（Mica 效果；失败自动回退不透明） |
 | `menubicons` | `true` | **v1.5.0** 在菜单项上显示 MDL2 图标（Segoe MDL2 Assets 字体内置绘制，无需外部图片） |
 | `uifont` | `Segoe UI Variable Text` | **v1.6.0** 菜单与 toast 的统一字体；系统无此字体时自动回退 `Segoe UI` |
 | `uifontsize` | `9` | **v1.6.0** 菜单 / toast 正文字号的基准（pt）；标题自动 +1 |
@@ -133,6 +137,8 @@ logs\dsh-tray.log       # 托盘自身日志（运行时生成，不入库）
 | 📜 代理日志 | **v1.4.0** 弹窗展示代理最近输出（assistant 正文 + turn 结束原因），点击「查看日志」打开 |
 | 🔔 代理通知 | **v1.4.0** 代理启动 / 完成 / 等待输入时通知气泡（`agentnotifications` 可关） |
 | 💬 通知气泡 | 状态跳变（启动/停止/恢复/异常/自动重启）时通知，不刷屏 |
+| 🗂️ Toast 堆叠 | **v1.9.0** toast 从右上角垂直堆叠（互不重叠），最多 `toastmax` 个（默认 4），超出强制关闭最旧；快速同类型事件 500ms 内在原位刷新（不再闪烁）；toast 带动作按钮（打开/重启/更新，`toastactions` 可关）与类型图标（信息/警告/错误） |
+| 📋 通知历史 | **v1.9.0** 菜单新增「通知 / Notifications / Уведомления」子菜单，记录最近 `toasthistory` 条通知（标题+时间，点击打开面板），可一键清空 |
 | ⏱️ Toast 自动关闭 | **v1.8.0** 修复 toast 悬挂问题：自动关闭计时器全部根级持有 + 250ms 硬截止扫描（duration+2500ms 强制关闭），toast 再也不会「一直挂着」；停留时长可用 `toastduration` 调节 |
 | 🌙 深色设计 | **v1.8.0** 默认深色主题；菜单 / toast / 图标全套深色调色板（近黑面板、柔和悬停、高对比文字）；菜单「Тема / Theme / 主题」即时切换 自动/浅色/深色并写入配置 |
 | 🪟 Chrome 应用 | **v1.4.1** 「打开面板」/双击图标/新对话在独立 **Chrome 应用（PWA）** 窗口打开，而非新标签页（配置 `chromeapplnk` 指向 `Chrome Apps\DeepSeek Harness.lnk`；失效则回退普通标签页） |
@@ -152,6 +158,7 @@ logs\dsh-tray.log       # 托盘自身日志（运行时生成，不入库）
 
 | 版本 | 内容 |
 |---|---|
+| **v1.9.0** | 🗂️ **堆叠 toast + 通知历史 + 动作按钮**：修复 toast 相互重叠——toast 改为右上角垂直堆叠（各自独立插槽、滑动进入，最多 `toastmax` 个，默认 4，超出强制关闭最旧）；每类事件有类型图标（信息/警告/错误，MDL2 圆形徽章）与动作按钮（打开面板 / 重启 dsh / 更新，`toastactions` 可关）；快速同类型事件 500ms 内在原位刷新，启动连跳不再闪烁。新增菜单「通知 / Notifications / Уведомления」子菜单，保留最近 `toasthistory` 条通知历史（点击打开面板，可清空）。Win11 下 toast 支持轻微半透明（Mica，`toasttranslucent`，失败回退不透明）。新增配置 `toastmax` / `toastactions` / `toasthistory` / `toasttranslucent`。 |
 | **v1.8.0** | 🔔 **toast 自动关闭修复 + 深色设计**：修复通知「挂在屏幕永不消失」——根因是 fade-out / 自动关闭的 WinForms Timer 作为事件闭包里的无根局部变量被 GC 回收，fade 永不执行；现在所有 toast 计时器挂在脚本级注册表（`$script:ToastTimers`）+ toast 上下文包，另加 250ms 硬截止扫描（duration+2500ms 强制关闭），toast 寿命有严格上限。新增 `toastduration`（毫秒，默认 4000）。🌇 **深色设计**：默认 `menutheme: dark`，菜单/toast/图标深色调色板重做（更漆黑的表面、更柔和的悬停、深色下更高对比）；菜单图标按主题即时重绘；新增菜单「Тема ▸ 自动/浅色/深色」子菜单，即时切换并把 `menutheme` 写回 `dsh-tray.json`。 |
 | **v1.7.1** | 🛡️ **崩溃-循环稳定化 + 不再卡 UI 的菜单动作**：修复 backoff 永不增长的 bug（RestartCount 不再在每次 `Start-Process` 后被清零，只在真正 Healthy 时重置 → 退避 5s→30s 真实生效）；新增 `maxconsecutiverestarts`（默认 10）上限，超过后停止自动重启、状态「需要干预」+ 一次错误 toast，手动「重启 dsh」重置。「开启新对话」与「停止代理」改为后台 runspace 执行（UI Automation / RPC 不再阻塞点击，新对话菜单项在执行期间显示禁用/"…"）；`Read-Config` 数值字段校验（非数字/非正/越界 → WARN + 回退默认值）。 |
 | **v1.6.0** | ✨ **统一平滑字体 + 更新检查**：菜单/图标/toast 统一使用配置字体（`uifont`，默认 Win11 的 Segoe UI Variable，自动回退 Segoe UI）；MDL2 图标与文字改用平滑抗锯齿（`Antialias` 替代 `AntiAliasGridFit`），消除“锯齿/毛边”；新增进程级 DPI 感知。新增**「检查更新」**菜单 + 周期自动检查（`updatecheck`/`updateintervalhours`）**@deepseek-ai/dsh（npm）**新版本；发现新版 → Win11 toast「发现新版本 X → Y」；`updateapply: true` 时**「更新到 vN」一键 `npm i -g` 并重启 dsh**。 |
@@ -185,3 +192,4 @@ logs\dsh-tray.log       # 托盘自身日志（运行时生成，不入库）
 - Requires `npm i -g @deepseek-ai/dsh`; Windows PowerShell 5.1+; UTF-8 **with BOM** for `dsh-tray.ps1` (contains non-ASCII zh/ru) — a bare no-BOM UTF-8 file is decoded as ANSI and will not parse
 - **Crash-loop hardening (v1.7.1):** the restart backoff really escalates now (5s → 30s, `restartdelayseconds * min(restarts, 6)`) because the crash counter is only reset when dsh is confirmed Healthy again; after `maxconsecutiverestarts` (default 10) consecutive crashes the tray stops auto-restarting, shows a "Needs intervention" status + one error toast, and the manual **Restart dsh** item resets the counter. "New Conversation" and "Stop agent" menu actions run their UI-Automation/RPC work on background runspaces so clicks never block the UI; `Read-Config` now rejects garbage numeric config values with a logged WARN.
 - **Toast auto-dismiss fixed + dark design (v1.8.0):** toasts no longer hang on screen forever — the auto-dismiss/fade timers now live on a script-scope registry plus the toast's own context, and a 250ms sweep force-closes any toast past `toastduration` (default 4000 ms) + 2.5 s, so a toast's lifetime is strictly bounded. The app now ships dark by default (`menutheme: dark`), with a reworked dark palette for the menu, fluent color table and toasts; a new **Theme** submenu (Auto / Light / Dark) switches the look live and persists `menutheme` to `dsh-tray.json`.
+- **Stacked toasts + notification history (v1.9.0):** toasts no longer overlap — they stack vertically in the top-right corner (each in its own slot, sliding in), capped at `toastmax` (default 4, oldest force-closed past the cap). Every event gets a type icon (info / warning / error MDL2 badge) and an action button (Open Dashboard / Restart dsh / Update, toggle with `toastactions`); rapid same-kind events refresh the top toast in place within 500 ms (no startup flicker). A new **Notifications** submenu keeps the last `toasthistory` notifications (click opens the dashboard, one-click clear). Toasts support subtle Mica translucency on Win11 (`toasttranslucent`, falls back to opaque). New config: `toastmax`, `toastactions`, `toasthistory`, `toasttranslucent`.

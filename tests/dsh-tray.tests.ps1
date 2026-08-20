@@ -921,3 +921,205 @@ Describe "Test-ToastDeadlineExceeded (v1.8.0 sweep)" {
         Test-ToastDeadlineExceeded -ShownAt (Get-Date).AddSeconds(-10) -Now (Get-Date) -DurationMs -1 -GraceMs 2500 | Should Be $false
     }
 }
+
+Describe "New-ToastSlotLayout (v1.9.0 stack)" {
+    It "places one toast top-right with the working-area padding" {
+        $wa = New-Object System.Drawing.Rectangle(0, 0, 1920, 1040)
+        $pts = @(New-ToastSlotLayout -Count 1 -WorkingArea $wa -Width 360 -Height 96 -Gap 10 -Pad 12)
+        $pts.Count | Should Be 1
+        $pts[0].X | Should Be (1920 - 360 - 12)
+        $pts[0].Y | Should Be (0 + 12)
+    }
+
+    It "stacks newer toasts above older ones without overlap" {
+        $wa = New-Object System.Drawing.Rectangle(0, 0, 1920, 1040)
+        $pts = @(New-ToastSlotLayout -Count 4 -WorkingArea $wa -Width 360 -Height 96 -Gap 10 -Pad 12)
+        $pts.Count | Should Be 4
+        for ($i = 1; $i -lt $pts.Count; $i++) {
+            $above = $pts[$i - 1]
+            $below = $pts[$i]
+            $below.Y - $above.Y | Should Be (96 + 10)
+            $below.X | Should Be $above.X
+        }
+    }
+
+    It "stays inside the working area for a full stack" {
+        $wa = New-Object System.Drawing.Rectangle(0, 0, 1280, 800)
+        $pts = @(New-ToastSlotLayout -Count 8 -WorkingArea $wa -Width 360 -Height 96 -Gap 10 -Pad 12)
+        foreach ($p in $pts) {
+            $p.X | Should BeGreaterThan ($wa.Left - 1)
+            $p.Y | Should BeGreaterThan ($wa.Top - 1)
+        }
+    }
+}
+
+Describe "Select-ToastStackTrim (v1.9.0 stack cap)" {
+    It "returns the oldest records beyond Max without mutating the stack" {
+        $stack = New-Object System.Collections.ArrayList
+        foreach ($i in 1..6) { [void]$stack.Add("rec$i") }
+        $drop = @(Select-ToastStackTrim -Stack $stack -Max 4)
+        $drop.Count | Should Be 2
+        $drop[0] | Should Be "rec5"
+        $drop[1] | Should Be "rec6"
+        $stack.Count | Should Be 6
+    }
+
+    It "returns nothing when the stack fits within Max" {
+        $stack = New-Object System.Collections.ArrayList
+        foreach ($i in 1..3) { [void]$stack.Add("rec$i") }
+        @(Select-ToastStackTrim -Stack $stack -Max 4).Count | Should Be 0
+    }
+}
+
+Describe "Test-ToastShouldUpdateInPlace (v1.9.0 debounce)" {
+    BeforeEach {
+        $script:Toasts = New-Object System.Collections.ArrayList
+    }
+
+    It "updates a young top toast of the same kind in place" {
+        $rec = @{ Kind = [System.Windows.Forms.ToolTipIcon]::Info; ShownAt = (Get-Date).AddSeconds(-0.2); Closing = $false; Entering = $false }
+        [void]$script:Toasts.Add($rec)
+        Test-ToastShouldUpdateInPlace -Kind ([System.Windows.Forms.ToolTipIcon]::Info) -Now (Get-Date) | Should Be $true
+    }
+
+    It "does not update a toast of a different kind" {
+        $rec = @{ Kind = [System.Windows.Forms.ToolTipIcon]::Info; ShownAt = (Get-Date).AddSeconds(-0.2); Closing = $false; Entering = $false }
+        [void]$script:Toasts.Add($rec)
+        Test-ToastShouldUpdateInPlace -Kind ([System.Windows.Forms.ToolTipIcon]::Error) -Now (Get-Date) | Should Be $false
+    }
+
+    It "does not update when the stack is empty" {
+        Test-ToastShouldUpdateInPlace -Kind ([System.Windows.Forms.ToolTipIcon]::Info) -Now (Get-Date) | Should Be $false
+    }
+
+    It "does not update a toast older than the debounce window" {
+        $rec = @{ Kind = [System.Windows.Forms.ToolTipIcon]::Info; ShownAt = (Get-Date).AddSeconds(-5); Closing = $false; Entering = $false }
+        [void]$script:Toasts.Add($rec)
+        Test-ToastShouldUpdateInPlace -Kind ([System.Windows.Forms.ToolTipIcon]::Info) -Now (Get-Date) | Should Be $false
+    }
+
+    It "does not update a toast that is closing" {
+        $rec = @{ Kind = [System.Windows.Forms.ToolTipIcon]::Info; ShownAt = (Get-Date).AddSeconds(-0.2); Closing = $true; Entering = $false }
+        [void]$script:Toasts.Add($rec)
+        Test-ToastShouldUpdateInPlace -Kind ([System.Windows.Forms.ToolTipIcon]::Info) -Now (Get-Date) | Should Be $false
+    }
+
+    It "updates a young same-kind toast that is still entering (startup debounce)" {
+        $rec = @{ Kind = [System.Windows.Forms.ToolTipIcon]::Info; ShownAt = (Get-Date).AddSeconds(-0.1); Closing = $false; Entering = $true }
+        [void]$script:Toasts.Add($rec)
+        Test-ToastShouldUpdateInPlace -Kind ([System.Windows.Forms.ToolTipIcon]::Info) -Now (Get-Date) | Should Be $true
+    }
+}
+
+Describe "Add-NotificationRecord (v1.9.0 history)" {
+    BeforeEach {
+        $script:ToastHistory = New-Object System.Collections.ArrayList
+        $script:ToastHistoryCap = 20
+    }
+
+    It "records a notification and rebuilds the menu" {
+        $script:NotificationMenuItem = $null
+        $script:NotificationMenu = $null
+        Add-NotificationRecord -Title "T" -Text "B" -Kind ([System.Windows.Forms.ToolTipIcon]::Info)
+        $script:ToastHistory.Count | Should Be 1
+        $script:ToastHistory[0].Title | Should Be "T"
+        $script:ToastHistory[0].Text | Should Be "B"
+    }
+
+    It "deduplicates identical consecutive events within 30s" {
+        Add-NotificationRecord -Title "T" -Text "B" -Kind ([System.Windows.Forms.ToolTipIcon]::Info)
+        Add-NotificationRecord -Title "T" -Text "B" -Kind ([System.Windows.Forms.ToolTipIcon]::Info)
+        $script:ToastHistory.Count | Should Be 1
+    }
+
+    It "records distinct events separately" {
+        Add-NotificationRecord -Title "T1" -Text "B1" -Kind ([System.Windows.Forms.ToolTipIcon]::Info)
+        Add-NotificationRecord -Title "T2" -Text "B2" -Kind ([System.Windows.Forms.ToolTipIcon]::Warning)
+        $script:ToastHistory.Count | Should Be 2
+    }
+
+    It "enforces the history cap, keeping the newest" {
+        $script:ToastHistoryCap = 2
+        Add-NotificationRecord -Title "A" -Text "a" -Kind ([System.Windows.Forms.ToolTipIcon]::Info)
+        Add-NotificationRecord -Title "B" -Text "b" -Kind ([System.Windows.Forms.ToolTipIcon]::Info)
+        Add-NotificationRecord -Title "C" -Text "c" -Kind ([System.Windows.Forms.ToolTipIcon]::Info)
+        $script:ToastHistory.Count | Should Be 2
+        $script:ToastHistory[0].Title | Should Be "B"
+        $script:ToastHistory[1].Title | Should Be "C"
+    }
+
+    It "records nothing when the history is disabled (cap 0)" {
+        $script:ToastHistoryCap = 0
+        Add-NotificationRecord -Title "A" -Text "a" -Kind ([System.Windows.Forms.ToolTipIcon]::Info)
+        $script:ToastHistory.Count | Should Be 0
+    }
+}
+
+Describe "Resolve-ToastKindMeta (v1.9.0)" {
+    It "maps Info to the info glyph and the accent colour" {
+        $accent = [System.Drawing.Color]::FromArgb(1, 2, 3)
+        $m = Resolve-ToastKindMeta -Kind ([System.Windows.Forms.ToolTipIcon]::Info) -Action "auto" -Accent $accent
+        $m.Glyph | Should Be 0xE946
+        $m.Bar.ToArgb() | Should Be $accent.ToArgb()
+        $m.Tint.ToArgb() | Should Be $accent.ToArgb()
+    }
+
+    It "maps Warning to amber and Error to red" {
+        $m = Resolve-ToastKindMeta -Kind ([System.Windows.Forms.ToolTipIcon]::Warning) -Action "auto" -Accent ([System.Drawing.Color]::FromArgb(1, 1, 1))
+        $m.Glyph | Should Be 0xE7BA
+        $m.Bar.ToArgb() | Should Be ([System.Drawing.Color]::FromArgb(246, 191, 38)).ToArgb()
+        $m = Resolve-ToastKindMeta -Kind ([System.Windows.Forms.ToolTipIcon]::Error) -Action "auto" -Accent ([System.Drawing.Color]::FromArgb(1, 1, 1))
+        $m.Glyph | Should Be 0xE711
+        $m.Bar.ToArgb() | Should Be ([System.Drawing.Color]::FromArgb(232, 17, 35)).ToArgb()
+    }
+
+    It "resolves the default action: open, restart for errors" {
+        $m = Resolve-ToastKindMeta -Kind ([System.Windows.Forms.ToolTipIcon]::Info) -Action "auto" -Accent ([System.Drawing.Color]::FromArgb(1, 1, 1))
+        $m.Action | Should Be "open"
+        $m = Resolve-ToastKindMeta -Kind ([System.Windows.Forms.ToolTipIcon]::Error) -Action "auto" -Accent ([System.Drawing.Color]::FromArgb(1, 1, 1))
+        $m.Action | Should Be "restart"
+    }
+
+    It "respects an explicit action override" {
+        $m = Resolve-ToastKindMeta -Kind ([System.Windows.Forms.ToolTipIcon]::Info) -Action "update" -Accent ([System.Drawing.Color]::FromArgb(1, 1, 1))
+        $m.Action | Should Be "update"
+    }
+}
+
+Describe "v1.9.0 toast config keys" {
+    It "defaults toastmax to 4 and validates it (1-8)" {
+        $cfg = Read-Config -ConfigPath (Join-Path $TestDrive "nonexistent.json")
+        $cfg.toastmax | Should Be 4
+        $tmp = Join-Path $TestDrive "tm.json"
+        @{ toastmax = 6 } | ConvertTo-Json | Set-Content -LiteralPath $tmp -Encoding UTF8
+        (Read-Config -ConfigPath $tmp).toastmax | Should Be 6
+        $bad = Join-Path $TestDrive "tm-bad.json"
+        @{ toastmax = 50 } | ConvertTo-Json | Set-Content -LiteralPath $bad -Encoding UTF8
+        (Read-Config -ConfigPath $bad).toastmax | Should Be 4
+        $str = Join-Path $TestDrive "tm-str.json"
+        @{ toastmax = "lots" } | ConvertTo-Json | Set-Content -LiteralPath $str -Encoding UTF8
+        (Read-Config -ConfigPath $str).toastmax | Should Be 4
+    }
+
+    It "defaults toasthistory to 20 and allows 0 (disabled)" {
+        $cfg = Read-Config -ConfigPath (Join-Path $TestDrive "nonexistent.json")
+        $cfg.toasthistory | Should Be 20
+        $tmp = Join-Path $TestDrive "th.json"
+        @{ toasthistory = 0 } | ConvertTo-Json | Set-Content -LiteralPath $tmp -Encoding UTF8
+        (Read-Config -ConfigPath $tmp).toasthistory | Should Be 0
+        $bad = Join-Path $TestDrive "th-bad.json"
+        @{ toasthistory = -5 } | ConvertTo-Json | Set-Content -LiteralPath $bad -Encoding UTF8
+        (Read-Config -ConfigPath $bad).toasthistory | Should Be 20
+    }
+
+    It "keeps toastactions and toasttranslucent booleans" {
+        $cfg = Read-Config -ConfigPath (Join-Path $TestDrive "nonexistent.json")
+        $cfg.toastactions | Should Be $true
+        $cfg.toasttranslucent | Should Be $true
+        $tmp = Join-Path $TestDrive "tb.json"
+        @{ toastactions = $false; toasttranslucent = $false } | ConvertTo-Json | Set-Content -LiteralPath $tmp -Encoding UTF8
+        $c = Read-Config -ConfigPath $tmp
+        $c.toastactions | Should Be $false
+        $c.toasttranslucent | Should Be $false
+    }
+}
